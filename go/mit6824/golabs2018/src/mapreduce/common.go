@@ -7,11 +7,20 @@ import (
 
 // Debugging enabled?
 const debugEnabled = false
+const mylogEnabled = false
 
 // debug() will only print if debugEnabled is true
 func debug(format string, a ...interface{}) (n int, err error) {
 	if debugEnabled {
 		n, err = fmt.Printf(format, a...)
+	}
+	return
+}
+
+func mylog(format string, a ...interface{}) (n int, err error) {
+	if mylogEnabled {
+		n, err = fmt.Printf(format, a...)
+		fmt.Println()
 	}
 	return
 }

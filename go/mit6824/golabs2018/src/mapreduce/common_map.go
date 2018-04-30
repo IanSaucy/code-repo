@@ -15,11 +15,11 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(filename string, contents string) []KeyValue,
 ) {
-	debug("---------doMap begin---------\n")
-	debug("jobName:%v\n", jobName)
-	debug("mapTask:%v\n", mapTask)
-	debug("inFile:%v\n", inFile)
-	debug("nReduce:%v\n", nReduce)
+	mylog("---------doMap begin---------")
+	mylog("jobName:", jobName)
+	mylog("mapTask:", mapTask)
+	mylog("inFile:", inFile)
+	mylog("nReduce:", nReduce)
 	
 	//
 	// doMap manages one map task: it should read one of the input files
@@ -67,20 +67,20 @@ func doMap(
 	// 读取文件
 	fileContent, err := readFile(inFile)
 	if err != nil {
-		debug("readFile error", err)
+		mylog("readFile error", err)
 		return
 	}
 
 	// 调用map函数
 	var kvList []KeyValue = mapF(inFile, fileContent)
 	if kvList == nil {
-		debug("mapF return nil")
+		mylog("mapF return nil")
 		return
 	}
 
 	// 遍历map的输出，输出到nReduce个不同的文件中
 	reduceList := make([][]KeyValue, nReduce)
-	for i, kv := range kvList {
+	for _, kv := range kvList {
 		reduceTask := ihash(kv.Key) % nReduce
 		reduceList[reduceTask] = append(reduceList[reduceTask], kv)
 	}
@@ -88,12 +88,12 @@ func doMap(
 		rname := reduceName(jobName, mapTask, i)
 		err := writeFileByJson(rname, reduceList[i])
 		if err != nil {
-			debug("writeFileByJson error", err)
+			mylog("writeFileByJson error", err)
 		}
 		
 	}
 	
-	debug("---------doMap end---------\n")
+	mylog("---------doMap end---------")
 }
 
 func ihash(s string) int {
@@ -118,5 +118,13 @@ func writeFileByJson(fileName string, kvList []KeyValue) error {
 	if encoder == nil {
 		return errors.New("NewEncoder return nil")
 	}
-	return encoder.Encode(kvList)
+	for _, kv := range kvList {
+		err := encoder.Encode(kv)
+		if err != nil {
+			mylog("Encode error ", err)
+			return err
+		}
+	}
+
+	return nil
 }

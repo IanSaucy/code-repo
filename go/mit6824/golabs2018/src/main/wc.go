@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"mapreduce"
 	"os"
+	"strings"
+	"strconv"
+	"unicode"
 )
 
 //
@@ -15,6 +18,22 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
+
+	// 分词
+	words := strings.FieldsFunc(contents, func (c rune) bool {
+		return !unicode.IsLetter(c)
+	})
+
+	// 输出所有是单词的
+	kvList := make([]mapreduce.KeyValue, len(words))
+	for i, word := range words {
+		ra := []rune(word)
+		if len(ra) > 0 && unicode.IsLetter(ra[0]) {
+			kvList[i] = mapreduce.KeyValue{word, "1"}
+		}
+	}
+
+	return kvList
 }
 
 //
@@ -24,6 +43,9 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 //
 func reduceF(key string, values []string) string {
 	// Your code here (Part II).
+
+	// 返回统计个数
+	return  strconv.Itoa(len(values))
 }
 
 // Can be run in 3 ways:

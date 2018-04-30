@@ -93,7 +93,7 @@ func doReduce(
 	reduceList := make([]string, len(keyList))
 	for i, key := range keyList {
 		result := reduceF(key, valueList[i])
-		reduceList = append(reduceList, result)
+		reduceList[i] = result
 	}
 
 	// 写到输出文件

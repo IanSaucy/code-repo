@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"errors"
+	"os"
 	"hash/fnv"
+	"io/ioutil"
+	"encoding/json"
 )
 
 func doMap(
@@ -11,6 +15,12 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(filename string, contents string) []KeyValue,
 ) {
+	debug("---------doMap begin---------\n")
+	debug("jobName:%v\n", jobName)
+	debug("mapTask:%v\n", mapTask)
+	debug("inFile:%v\n", inFile)
+	debug("nReduce:%v\n", nReduce)
+	
 	//
 	// doMap manages one map task: it should read one of the input files
 	// (inFile), call the user-defined map function (mapF) for that file's
@@ -53,10 +63,60 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+
+	// 读取文件
+	fileContent, err := readFile(inFile)
+	if err != nil {
+		debug("readFile error", err)
+		return
+	}
+
+	// 调用map函数
+	var kvList []KeyValue = mapF(inFile, fileContent)
+	if kvList == nil {
+		debug("mapF return nil")
+		return
+	}
+
+	// 遍历map的输出，输出到nReduce个不同的文件中
+	reduceList := make([][]KeyValue, nReduce)
+	for i, kv := range kvList {
+		reduceTask := ihash(kv.Key) % nReduce
+		reduceList[reduceTask] = append(reduceList[reduceTask], kv)
+	}
+	for i := 0; i < nReduce; i++ {
+		rname := reduceName(jobName, mapTask, i)
+		err := writeFileByJson(rname, reduceList[i])
+		if err != nil {
+			debug("writeFileByJson error", err)
+		}
+		
+	}
+	
+	debug("---------doMap end---------\n")
 }
 
 func ihash(s string) int {
 	h := fnv.New32a()
 	h.Write([]byte(s))
 	return int(h.Sum32() & 0x7fffffff)
+}
+
+func readFile(inFile string) (string,error) {
+	bytes, err := ioutil.ReadFile(inFile)
+	return string(bytes[:]),err
+}
+
+func writeFileByJson(fileName string, kvList []KeyValue) error {
+	file, err := os.Create(fileName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	
+	encoder := json.NewEncoder(file)
+	if encoder == nil {
+		return errors.New("NewEncoder return nil")
+	}
+	return encoder.Encode(kvList)
 }

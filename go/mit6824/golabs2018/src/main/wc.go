@@ -27,10 +27,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// 输出所有是单词的
 	kvList := make([]mapreduce.KeyValue, len(words))
 	for i, word := range words {
-		ra := []rune(word)
-		if len(ra) > 0 && unicode.IsLetter(ra[0]) {
-			kvList[i] = mapreduce.KeyValue{word, "1"}
-		}
+		kvList[i] = mapreduce.KeyValue{word, "1"}
 	}
 
 	return kvList

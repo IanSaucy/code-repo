@@ -37,27 +37,46 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// 遍历所有任务，获取可用的worker，发起RPC任务
 	var waitGroup sync.WaitGroup
 
+	waitGroup.Add(ntasks)
+
 	for i := 0; i < ntasks; i++ {
-		workerAddress := getWorkerAddress(registerChan)
-
-		taskArgs := DoTaskArgs{
-			JobName:       jobName,
-			Phase:         phase,
-			TaskNumber:    i,
-			NumOtherPhase: n_other}
-		if phase == mapPhase {
-			taskArgs.File = mapFiles[i]
-		}
-
-		waitGroup.Add(1)
-		go doWorkerTask(workerAddress, taskArgs, registerChan, &waitGroup)
+		go doSchedule(jobName, mapFiles, n_other, phase, registerChan, i, &waitGroup)
 	}
 
-	fmt.Printf("waitGroup Wait begin\n")
+	fmt.Printf("waitGroup Wait\n")
 	waitGroup.Wait()
-	fmt.Printf("waitGroup Wait end\n")
 
 	fmt.Printf("Schedule: %v done\n", phase)
+}
+
+func doSchedule(jobName string, mapFiles []string, n_other int, phase jobPhase, registerChan chan string, task int, waitGroup *sync.WaitGroup) {
+	workerAddress := getWorkerAddress(registerChan)
+
+	taskArgs := DoTaskArgs{
+		JobName:       jobName,
+		Phase:         phase,
+		TaskNumber:    task,
+		NumOtherPhase: n_other}
+	if phase == mapPhase {
+		taskArgs.File = mapFiles[task]
+	}
+
+	flag := call(workerAddress, "Worker.DoTask", taskArgs, nil)
+	if flag {
+		fmt.Printf("DoTask %d success\n", taskArgs.TaskNumber)
+
+		waitGroup.Done()
+
+		go func(address string) {
+			fmt.Printf("begin return worker address to registerChan %s\n", workerAddress)
+			registerChan <- address
+			fmt.Printf("end return worker address to registerChan %s\n", workerAddress)
+		}(workerAddress)
+	} else {
+		fmt.Printf("DoTask %d fail\n", taskArgs.TaskNumber)
+
+		go doSchedule(jobName, mapFiles, n_other, phase, registerChan, task, waitGroup)
+	}
 }
 
 func getWorkerAddress(registerChan chan string) string {
@@ -68,19 +87,7 @@ func getWorkerAddress(registerChan chan string) string {
 }
 
 func doWorkerTask(workerAddress string, taskArgs DoTaskArgs, registerChan chan string, waitGroup *sync.WaitGroup) {
-	flag := call(workerAddress, "Worker.DoTask", taskArgs, nil)
-	if !flag {
-		fmt.Printf("DoTask %d fail\n", taskArgs.TaskNumber)
-	} else {
-		fmt.Printf("DoTask %d success\n", taskArgs.TaskNumber)
-	}
 
-	fmt.Printf("waitGroup Done\n")
-	waitGroup.Done()
 
-	go func(address string) {
-		fmt.Printf("begin return worker address to registerChan %s\n", workerAddress)
-		registerChan <- address
-		fmt.Printf("end return worker address to registerChan %s\n", workerAddress)
-	}(workerAddress)
+	
 }

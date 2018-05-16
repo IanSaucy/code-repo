@@ -26,15 +26,6 @@ import "fmt"
 // import "bytes"
 // import "labgob"
 
-const mylogEnabled = true
-
-func mylog(a ...interface{}) (n int, err error) {
-	if mylogEnabled {
-		n, err = fmt.Println(a...)
-	}
-	return
-}
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -668,7 +659,7 @@ func (rf *Raft) afterCandidateElectionTimeout(logicalClock int, duration time.Du
 func (rf *Raft) afterCandidateRecvMajorityVote(logicalClock int, voteCount int, total int) {
 	mylog(rf.getStateDescription(), "收到多数派投票：", voteCount, "/", total, ",AppendEntries RPC个数:", rf.getAppendEntriesCount(), "，RequestVote RPC个数:", rf.getRequestVoteCount(), "，VotedFor:", rf.getVotedFor())
 
-	mylog(rf.getStateDescription(), "切换到", stateToString(STATE_LEADER))
+	mylog2(rf.getStateDescription(), "切换到", stateToString(STATE_LEADER))
 	go rf.startStateByLogicalClock(STATE_LEADER, logicalClock)
 }
 

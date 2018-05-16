@@ -1,0 +1,56 @@
+所有服务器
+	优先处理
+		If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+	如果当前任期已经投票了，但是发现了更高任期，则重置votedFor为空，这样可以立即对新任期投票。
+
+	凡是说明“reply false”，说明是立即返回。
+
+	当收到Reply时
+		比较原来发送RPC的任期和当前任期
+			不一致
+				说明这个过程中任期发生了变化
+			一致
+				正常处理
+		比较对方任期和当前任期
+			对方任期更高
+				必须退出当前状态，切换到Follower
+			对方任期和我的相等
+				正常操作
+			
+
+选举
+	重置选举超时
+		1、从当前Leader收到了一个AppendEntries RPC
+		2、开始了选举
+		3、给其他候选人投票了
+
+	Follower
+		切换到Candidate
+			没有收到当前Leader的AppendEntries RPC
+			没有投票给其他候选人
+
+	Candidate
+		正在选举中，当选举超时了，应该发起新的选举。
+
+日志复制
+
+
+AppendEntries RPC
+	      如果prevLogIndex超过了日志的末尾，应该当成有那个日志但是任期不匹配，返回false
+	      心跳信息不能当成特殊的，必须严格检查
+	      commitIndex > lastApplied放在什么地方检查？？
+	      当Leader对外发送AppendEntries RPC，收到了拒绝响应，但不是因为日志不一致，这说明任期旧了，必须退出Leader。
+	      Leader更新commitIndex时，必须是和自己的任期相等。
+
+
+优化
+	日志压缩
+		
+	加速日志回溯
+		AppendEntries RPC检查Follower的日志不匹配时，一种办法是每次减1，这个可以优化。
+		如果Follower没有prevLogIndex这个日志，应该返回conflictIndex = len(log)， conflictTerm = None.
+		如果Follower有prevLogIndex这个日志，但是任期不匹配，应该返回conflictTerm = log[prevLogIndex].Term，conflictIndex=往前搜索日志，找到conflictTerm的第一个日志索引
+		当Leader收到一个日志冲突的响应，Leader在日志中找到跟conflictTerm的日志，如果找到了，nextIndex=conflictTerm任期的下一个，如果没找到，则nextIndex = conflictIndex。
+
+使用Raft的应用
+	

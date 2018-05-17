@@ -22,6 +22,7 @@ import "labrpc"
 import "time"
 import "math/rand"
 import "fmt"
+import "sync/atomic"
 
 // import "bytes"
 // import "labgob"
@@ -60,7 +61,8 @@ const ELECTION_TIMER_CHECK_SLEEP = 10
 const HEARTBEAT_CHECK_SLEEP = 10
 
 // 是否打开Raft调试
-const DEBUG_RAFT = false
+const DEBUG_RAFT = true
+const DEBUG_RAFT_LOCK = false
 
 type LogEntry struct {
 	Term  int // Leader的当前任期
@@ -110,14 +112,14 @@ type Raft struct {
 }
 
 func stateToString(state int) string {
-	select {
-	case state == STATE_FOLLOWER:
+	switch state {
+	case STATE_FOLLOWER:
 		return "Follower"
-	case  state == STATE_CANDIDATE:
+	case STATE_CANDIDATE:
 		return "Candidate"
-	case state == STATE_LEADER:
+	case STATE_LEADER:
 		return "Leader"
-	case  state == STATE_KILLED :
+	case STATE_KILLED :
 		return "Killed"
 	default:
 		return fmt.Sprintf("其他%d", state)
@@ -129,24 +131,24 @@ func (rf *Raft) getStatusInfo() string {
 func (rf *Raft) getStatusInfoByLock() string {
 	rf.Lock()
 	currentTerm := rf.currentTerm
-	state := rf.getState()
-	logicalClock := rf.getLogicalClock()
+	state := rf.state
+	logicalClock := rf.logicalClock
 	rf.Unlock()
 	
 	return fmt.Sprintf("Raft[%d]任期[%d]状态[%s]时钟[%d] ", rf.me, currentTerm, stateToString(state), logicalClock)
 }
 
 func (rf *Raft)Lock() {
-	if DEBUG_RAFT {
+	if DEBUG_RAFT_LOCK {
 		mylog(rf.getStatusInfo(), "开始Lock")
 	}
 	rf.mu.Lock()
-	if DEBUG_RAFT {
+	if DEBUG_RAFT_LOCK {
 		mylog(rf.getStatusInfo(), "得到Lock")
 	}
 }
 func (rf *Raft)Unlock() {
-	if DEBUG_RAFT {
+	if DEBUG_RAFT_LOCK {
 		mylog(rf.getStatusInfo(), "Unlock")
 	}
 	rf.mu.Unlock()
@@ -197,9 +199,9 @@ func (rf *Raft)checkLogUpToDate(logTerm int, logIndex int) int {
 
 func (rf *Raft) voteForCandidate(args *RequestVoteArgs) bool {
 	if (rf.votedFor == NULL_PEER_ID || rf.votedFor == args.CandidateId) && (rf.checkLogUpToDate(args.LastLogTerm, args.LastLogIndex) <= 0) {
-		rf.votedFor = v
+		rf.votedFor = args.CandidateId
 		// 给其他候选人投票了，重置选举超时
-		mylog(rf.getStatusInfo(), "给Raft[", v, "]投票，因此重置选举超时")
+		mylog(rf.getStatusInfo(), "给Raft[", args.CandidateId, "]投票，因此重置选举超时")
 		rf.resetElectionTimerForVote()
 		mylog(rf.getStatusInfo(), "新选举超时时间", rf.electionTimeout)
 		
@@ -397,7 +399,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	
 	if args.Term > rf.currentTerm {
 		// 对方任期更高
-		mylog(rf.getStatusInfo(), "AppendEntries RPC发现更高Raft[", args.CandidateId, "]任期[", args.Term, "]，切换到Follower")
+		mylog(rf.getStatusInfo(), "AppendEntries RPC发现更高Raft[", args.LeaderId, "]任期[", args.Term, "]，切换到Follower")
 		rf.disconverHigherTerm(args.Term)
 	}
 
@@ -532,7 +534,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// 一个线程用于定时检查选举是否超时
-	go rf.handleElectionTimer
+	go rf.handleElectionTimer()
 	
 	// 一个线程用于定时发送心跳
 	go rf.handleHeartbeat()
@@ -602,7 +604,7 @@ func (rf *Raft)startNewElection() {
 		LastLogIndex: 0,
 		LastLogTerm:  0,
 	}
-	voteCount := 0
+	var voteCount int32  = 0
 
 	// Send RequestVote RPCs to all other servers
 	for i := 0; i < len(rf.peers); i++ {
@@ -614,12 +616,12 @@ func (rf *Raft)startNewElection() {
 			mydebug(rf.getStatusInfoByLock(), ",结束向服务器", server, "发送RequestVote RPC,", ok)
 
 			if ok && reply.VoteGranted {
-				voteCount++
-				majority := len(rf.peers)/2 + 1
-				if voteCount >= majority {
+				count := atomic.AddInt32(&voteCount, 1)
+				majority := int32(len(rf.peers)/2 + 1)
+				if count  >= majority {
 					// 收到多数派投票
 					mydebug("多数派个数:", majority)
-					mydebug(rf.getStatusInfoByLock(), "收到多数派投票：", voteCount, "/", total, "，VotedFor:", rf.getVotedFor())
+					mydebug(rf.getStatusInfoByLock(), "收到多数派投票：", count, "/", len(rf.peers), "，VotedFor:", rf.getVotedFor())
 
 					rf.Lock()
 					if args.Term == rf.currentTerm {
@@ -654,7 +656,7 @@ func (rf *Raft)disconverHigherTerm(higherTerm int) {
 	rf.votedFor = NULL_PEER_ID
 	rf.logicalClock++
 
-	if rf.state != state {
+	if rf.state != STATE_FOLLOWER {
 		mylog(rf.getStatusInfo(), "转换状态到--->", stateToString(STATE_FOLLOWER))
 		rf.internalStartNewState(STATE_FOLLOWER)
 	} else {
@@ -703,5 +705,5 @@ func (rf *Raft)sendHeartbeat() {
 		}(i)
 	}
 
-	rf.lastHeartbeatTimestamp := time.Now()
+	rf.lastHeartbeatTimestamp = time.Now()
 }

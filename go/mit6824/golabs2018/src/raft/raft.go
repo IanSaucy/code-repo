@@ -53,6 +53,11 @@ const STATE_KILLED int = -1 // 表示raft终止了
 // 无效的服务器id
 const NULL_PEER_ID int = -1
 
+// 无效的任期
+const NULL_TERM = 0
+// 无效的日志索引
+const NULL_LOG_INDEX = 0
+
 // 超时时间
 const HEARTBEAT_TIMEOUT = 100
 const MIN_ELECTION_TIMEOUT = 500
@@ -61,7 +66,7 @@ const ELECTION_TIMER_CHECK_SLEEP = 10
 const HEARTBEAT_CHECK_SLEEP = 10
 
 // 是否打开Raft调试
-const DEBUG_RAFT = true
+const DEBUG_RAFT = false
 const DEBUG_RAFT_LOCK = false
 
 type LogEntry struct {
@@ -108,6 +113,8 @@ type Raft struct {
 	// Leader特有的信息 ----------------------------
 	nextIndex []int // 对于每一个服务器，下一条发送日志索引，初始化为Leader的最新日志索引+1
 	matchIndex [] int // 对于每一个服务器，最高的commitIndex，初始化为0
+
+	
 	// -------------------------------------------
 }
 
@@ -267,7 +274,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 //
 // save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
+// where it can later be retrieved after a crash and restart
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
@@ -459,6 +466,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft)getNewLogIndex() int {
+	n := len(rf.log)
+	if n > 0 {
+		return rf.log[n - 1].Index + 1
+	} else {
+		return 1
+	}
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -479,6 +495,43 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.Lock()
+	if rf.state != STATE_LEADER {
+		isLeader = false
+	} else {
+		// 领导人把这条命令作为新的日志条目加入到它的日志中去，
+		// 然后并行的向其他服务器发起 AppendEntries RPC ，要求其它服务器复制这个条目。
+		// 当这个条目被安全的复制之后，领导人会将这个条目应用到它的状态机中并且会向客户端返回执行结果。
+		
+		newLogEntry := LogEntry{
+			Term : rf.currentTerm,
+			Index : rf.getNewLogIndex(),
+			Command : command,
+		}
+		rf.log = append(rf.log, newLogEntry)
+		
+		args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      []LogEntry{},
+		LeaderCommit: 0,
+	}
+
+	for i := 0; i < len(rf.peers); i++ {
+		go func(server int) {
+			reply := AppendEntriesReply{}
+			
+			mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
+		}(i)
+	}
+
+	rf.lastHeartbeatTimestamp = time.Now()
+	}
+	rf.Unlock()
 
 	return index, term, isLeader
 }
@@ -529,6 +582,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = NULL_PEER_ID
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -608,7 +664,7 @@ func (rf *Raft)startNewElection() {
 
 	// Send RequestVote RPCs to all other servers
 	for i := 0; i < len(rf.peers); i++ {
-		go func(server int, logicalClock int) {
+		go func(server int) {
 			reply := RequestVoteReply{}
 
 			mydebug(rf.getStatusInfoByLock(), ",开始向服务器", server, "发送RequestVote RPC")
@@ -634,7 +690,7 @@ func (rf *Raft)startNewElection() {
 					rf.Unlock()
 				}
 			}
-		}(i, rf.logicalClock)
+		}(i)
 	}
 }
 
@@ -646,7 +702,7 @@ func (rf *Raft) internalStartNewState(state int) {
 	} else if state == STATE_CANDIDATE {
 		rf.startNewElection()
 	} else if state == STATE_LEADER {
-		// 
+		rf.startLeader()
 	}
 }
 
@@ -661,6 +717,13 @@ func (rf *Raft)disconverHigherTerm(higherTerm int) {
 		rf.internalStartNewState(STATE_FOLLOWER)
 	} else {
 		mylog(rf.getStatusInfo(), "不用转换状态，因为状态一致：", stateToString(STATE_FOLLOWER))
+	}
+}
+
+func (rf *Raft)startLeader() {
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = rf.commitIndex + 1
+		rf.matchIndex[i] = 0
 	}
 }
 
@@ -686,24 +749,41 @@ func (rf *Raft)handleHeartbeat() {
 }
 
 func (rf *Raft)sendHeartbeat() {
-	args := AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      []LogEntry{},
-		LeaderCommit: 0,
-	}
-
 	for i := 0; i < len(rf.peers); i++ {
-		go func(server int) {
-			reply := AppendEntriesReply{}
-			
-			mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
-		}(i)
+		if i != rf.me {
+			go rf.sendHeartbeatToServer(i)
+		}
 	}
 
 	rf.lastHeartbeatTimestamp = time.Now()
+}
+func (rf *Raft)sendHeartbeatToServer(server int) {
+	rf.Lock()
+	defer rf.Unlock()
+
+	if rf.state == STATE_LEADER {
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Entries:      []LogEntry{},
+			LeaderCommit: rf.commitIndex,
+		}
+
+		go func() {
+			reply := AppendEntriesReply{}	
+			mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
+
+			if ok {
+				if reply.Success {
+				
+				} else {
+
+				}
+			}
+		}()
+	}
 }

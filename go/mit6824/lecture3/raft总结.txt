@@ -24,6 +24,11 @@
 		2、开始了选举
 		3、给其他候选人投票了
 
+	如何比较日志更新
+		通过比较日志中最后一个条目的索引和任期号来决定两个日志哪一个更新。
+		如果两个日志的任期号不同，任期号大的更新；
+		如果任期号相同，更长的日志更新。
+
 	Follower
 		切换到Candidate
 			没有收到当前Leader的AppendEntries RPC
@@ -33,6 +38,12 @@
 		正在选举中，当选举超时了，应该发起新的选举。
 
 日志复制
+	日志之间不允许出现空缺
+	Leader收到客户端请求
+		Leader把这条命令作为新的日志条目加到自己的日志中
+		Leader向其他服务器发送AppendEntries RPC
+		当收到多数派请求之后，Leader把这条日志条目应用到状态机中
+		Leader向客户端返回结果
 
 
 AppendEntries RPC
@@ -52,5 +63,35 @@ AppendEntries RPC
 		如果Follower有prevLogIndex这个日志，但是任期不匹配，应该返回conflictTerm = log[prevLogIndex].Term，conflictIndex=往前搜索日志，找到conflictTerm的第一个日志索引
 		当Leader收到一个日志冲突的响应，Leader在日志中找到跟conflictTerm的日志，如果找到了，nextIndex=conflictTerm任期的下一个，如果没找到，则nextIndex = conflictIndex。
 
-使用Raft的应用
-	
+基于Raft的应用开发
+	每一个客户端请求分配一个索引，然后等到这个索引的日志完成之后，再返回给客户端成功与否
+	检测重复的客户端请求
+		每个客户端一个唯一id，然后每个请求给一个单调递增的编号
+	客户端分配的索引，有可能重复出现
+		S1给客户端1分配1，然后S1故障；S2给客户端2分配1。
+
+Raft代码结构
+	一个线程用于定时检查选举是否超时
+		用于Follower
+		记录上一次接收到当前Leader的AppendEntries RPC的时间戳
+		检查当前时间减去上一次时间戳是否大于选举超时
+		睡眠一小会儿
+	一个线程用于定时发送心跳
+		用于Leader
+		记录上一次发送心跳的时间戳
+		睡眠一小会儿
+	一个线程用于把已经提交的日志发送到applyCh
+		把已经提交的日志顺序发送到applyCh
+	一个线程用于apply
+		等待commitIndex更新的信号量
+		更新lastApplied
+	锁
+		当需要修改Raft中多个共享变量时，必须一致持有锁，直到全部修改完
+		锁不能加载可能等待的地方
+			从一个go channel读取
+			向一个go channel发送
+			等待一个timer
+			调用time.Sleep()
+			发送RPC，等待返回
+		发送RPC
+			收到响应时，必须检查当前任期是否是之前发送的任期，防止当前任期发生变化

@@ -13,17 +13,17 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const mylogEnabled = false
-const mylogEnabled2 = true
+const mydebugEnabled = false
+const mylogEnabled = true
 
-func mylog(a ...interface{}) (n int, err error) {
-	if mylogEnabled {
+func mydebug(a ...interface{}) (n int, err error) {
+	if mydebugEnabled {
 		n, err = fmt.Println(a...)
 	}
 	return
 }
-func mylog2(a ...interface{}) (n int, err error) {
-	if mylogEnabled2 {
+func mylog(a ...interface{}) (n int, err error) {
+	if mylogEnabled {
 		n, err = fmt.Println(a...)
 	}
 	return

@@ -49,8 +49,25 @@ const STATE_FOLLOWER int = 2
 const STATE_CANDIDATE int = 3
 const STATE_KILLED int = -1 // 表示raft终止了
 
-// 无效的候选人id
-const NULL_CANDIDATE_ID int = -1
+// 无效的服务器id
+const NULL_PEER_ID int = -1
+
+// 超时时间
+const HEARTBEAT_TIMEOUT = 100
+const MIN_ELECTION_TIMEOUT = 500
+const MAX_ELECTION_TIMEOUT = 1000
+const ELECTION_TIMER_CHECK_SLEEP = 10
+const HEARTBEAT_CHECK_SLEEP = 10
+
+// 是否打开Raft调试
+const DEBUG_RAFT = false
+
+type LogEntry struct {
+	Term  int // Leader的当前任期
+	Index int // Leader给日志分配的索引
+
+	Command interface{} // 日志命令
+}
 
 //
 // A Go object implementing a single Raft peer.
@@ -66,139 +83,166 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// 开始新状态之前，必须保证之前开始的旧状态的代码不起作用
-	// 每次开始新状态时，分配一个逻辑时钟，所有的相关代码必须只能在逻辑时钟相同的情况起作用
+	// 所有的相关代码必须只能在逻辑时钟相同的情况起作用
+	// 当任期发生变化，或者状态发生变化，逻辑时钟递增
 	logicalClock int
+	
+	lastLeaderUpdateTimestamp time.Time // 最新的Leader更新时间戳
 
-	// AppendEntries RPC计数
-	appendEntriesCount int
-	// RequestVote RPC计数
-	requestVoteCount int
+	electionTimestamp time.Time // 选举超时检测的时间
+	electionTimeout time.Duration // 选举超时时间
 
-	// 当前状态
-	state int
-	// 当前任期
-	currentTerm int
-	// 投票的候选人id
-	votedFor int
+	lastHeartbeatTimestamp time.Time // 上一次发送心跳的时间戳
+	
+	state int 	// 当前状态
+	
+	currentTerm int 	// 当前任期，默认值为0
+	votedFor int 	// 当前任期之内投票的候选人id，默认为空
+	log []LogEntry  // 日志，第一条日志索引为1
+
+	commitIndex int // 已经提交的最高的日志索引，默认值为0
+	lastApplied int // 已经应用到状态机的最高的日志索引，默认为0
+
+	// Leader特有的信息 ----------------------------
+	nextIndex []int // 对于每一个服务器，下一条发送日志索引，初始化为Leader的最新日志索引+1
+	matchIndex [] int // 对于每一个服务器，最高的commitIndex，初始化为0
+	// -------------------------------------------
+}
+
+func stateToString(state int) string {
+	select {
+	case state == STATE_FOLLOWER:
+		return "Follower"
+	case  state == STATE_CANDIDATE:
+		return "Candidate"
+	case state == STATE_LEADER:
+		return "Leader"
+	case  state == STATE_KILLED :
+		return "Killed"
+	default:
+		return fmt.Sprintf("其他%d", state)
+	}
+}
+func (rf *Raft) getStatusInfo() string {
+	return fmt.Sprintf("Raft[%d]任期[%d]状态[%s]时钟[%d] ", rf.me, rf.currentTerm, stateToString(rf.state), rf.logicalClock)
+}
+func (rf *Raft) getStatusInfoByLock() string {
+	rf.Lock()
+	currentTerm := rf.currentTerm
+	state := rf.getState()
+	logicalClock := rf.getLogicalClock()
+	rf.Unlock()
+	
+	return fmt.Sprintf("Raft[%d]任期[%d]状态[%s]时钟[%d] ", rf.me, currentTerm, stateToString(state), logicalClock)
+}
+
+func (rf *Raft)Lock() {
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfo(), "开始Lock")
+	}
+	rf.mu.Lock()
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfo(), "得到Lock")
+	}
+}
+func (rf *Raft)Unlock() {
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfo(), "Unlock")
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) getLogicalClock() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock()
+	defer rf.Unlock()
 	return rf.logicalClock
 }
-func (rf *Raft) getAppendEntriesCount() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.appendEntriesCount
-}
-func (rf *Raft) setAppendEntriesCount(v int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.appendEntriesCount = v
-}
-func (rf *Raft) incAppendEntriesCount() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.appendEntriesCount += 1
-}
-func (rf *Raft) getRequestVoteCount() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.requestVoteCount
-}
-func (rf *Raft) setRequestVoteCount(v int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.requestVoteCount = v
-}
-func (rf *Raft) incRequestVoteCount() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.requestVoteCount += 1
-}
 func (rf *Raft) getState() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock()
+	defer rf.Unlock()
 	return rf.state
 }
-func (rf *Raft) setState(v int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.state = v
+func (rf *Raft) getCurrentTerm() int {
+	rf.Lock()
+	defer rf.Unlock()
+	return rf.currentTerm
 }
 func (rf *Raft) getVotedFor() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock()
+	defer rf.Unlock()
 	return rf.votedFor
 }
-func (rf *Raft) setVotedFor(v int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.votedFor = v
-}
-func (rf *Raft) voteForSelf() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.votedFor = rf.me
-}
-func (rf *Raft) voteForCandidate(v int) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
-	if rf.votedFor == NULL_CANDIDATE_ID || rf.votedFor == v {
+// 比较自己的日志和对方的日志，返回1表示自己的更新；返回0表示一样新；返回-1表示自己的更旧；
+func (rf *Raft)checkLogUpToDate(logTerm int, logIndex int) int {
+	n := len(rf.log)
+	if n > 0 {
+		if rf.log[n - 1].Term > logTerm {
+			return 1
+		} else if rf.log[n - 1].Term < logTerm {
+			return -1
+		} else {
+			if rf.log[n - 1].Index > logIndex {
+				return 1
+			} else if rf.log[n - 1].Index < logIndex {
+				return -1
+			} else {
+				return 0
+			}
+		}
+	} else {
+		return -1
+	}
+}
+
+func (rf *Raft) voteForCandidate(args *RequestVoteArgs) bool {
+	if (rf.votedFor == NULL_PEER_ID || rf.votedFor == args.CandidateId) && (rf.checkLogUpToDate(args.LastLogTerm, args.LastLogIndex) <= 0) {
 		rf.votedFor = v
+		// 给其他候选人投票了，重置选举超时
+		mylog(rf.getStatusInfo(), "给Raft[", v, "]投票，因此重置选举超时")
+		rf.resetElectionTimerForVote()
+		mylog(rf.getStatusInfo(), "新选举超时时间", rf.electionTimeout)
+		
 		return true
 	} else {
 		return false
 	}
 }
-func (rf *Raft) incCurrentTerm() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.currentTerm += 1
+func (rf *Raft)resetElectionTimerForVote() {
+	rf.resetElectionTimer()
 }
-func (rf *Raft) addCurrentTerm(v int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.currentTerm += v
+func (rf *Raft)resetElectionTimerForLeader() {
+	rf.lastLeaderUpdateTimestamp = time.Now()
+	rf.electionTimestamp = rf.lastLeaderUpdateTimestamp
+	rf.electionTimeout = rf.getElectionTimeout()
 }
-func (rf *Raft) getCurrentTerm() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.currentTerm
+func (rf *Raft)resetElectionTimer() {
+	rf.electionTimestamp = time.Now()
+	rf.electionTimeout = rf.getElectionTimeout()
 }
-func stateToString(state int) string {
-	if state == STATE_FOLLOWER {
-		return "Follower"
-	} else if state == STATE_CANDIDATE {
-		return "Candidate"
-	} else if state == STATE_LEADER {
-		return "Leader"
-	} else if state == STATE_KILLED {
-		return "Killed"
+func (rf *Raft)isElectionTimeout() bool {
+	if time.Since(rf.electionTimestamp) > rf.electionTimeout {
+		return true
 	} else {
-		return fmt.Sprintf("其他%d", state)
+		return false
 	}
 }
-func (rf *Raft) getStateDescription() string {
-	return fmt.Sprintf("Raft[%d]任期[%d]状态[%s]逻辑时钟[%d]", rf.me, rf.getCurrentTerm(), stateToString(rf.getState()), rf.getLogicalClock())
-}
-func (rf *Raft) getStateDescription2() string {
-	return fmt.Sprintf("Raft[%d]任期[%d]状态[%s]逻辑时钟[%d]", rf.me, rf.currentTerm, stateToString(rf.state), rf.logicalClock)
+func (rf *Raft)isHeartbeatTimeout() bool {
+	if time.Since(rf.lastHeartbeatTimestamp) > rf.getHeartbeatTimeout() {
+		return true
+	} else {
+		return false
+	}
 }
 
 // 获取随机的选举超时时间，单位毫秒
 func (rf *Raft) getElectionTimeout() time.Duration {
-	const MIN_ELECTION_TIMEOUT = 500
-	const MAX_ELECTION_TIMEOUT = 1000
 	ms := MIN_ELECTION_TIMEOUT + (rand.Int63() % (MAX_ELECTION_TIMEOUT - MIN_ELECTION_TIMEOUT))
 	return time.Duration(ms) * time.Millisecond
 }
 
 // 获取Leader发送心跳信息的时间，单位毫秒
 func (rf *Raft) getHeartbeatTimeout() time.Duration {
-	const HEARTBEAT_TIMEOUT = 100
 	ms := HEARTBEAT_TIMEOUT
 	return time.Duration(ms) * time.Millisecond
 }
@@ -211,9 +255,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 
-	term = rf.getCurrentTerm()
-	isleader = rf.getState() == STATE_LEADER
-
+	rf.Lock()
+	term = rf.currentTerm
+	isleader = (rf.state == STATE_LEADER)
+	rf.Unlock()
+	
 	return term, isleader
 }
 
@@ -275,62 +321,44 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 
 	Term        int  // 当前任期，用于候选人更新自己的任期
-	VoteGranted bool // true表示接收了投票
-}
-
-// 参数的term大于当前任期，返回1，相等返回0，小于返回-1
-func (rf *Raft) checkRequestVoteTerm(args *RequestVoteArgs) int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = NULL_CANDIDATE_ID
-		mylog(rf.getStateDescription2(), "，RequestVote RPC发现更高Raft[", args.CandidateId, "]任期[", args.Term, "]，切换到Follower")
-		go rf.convertToState(STATE_FOLLOWER)
-		return 1
-	} else if args.Term == rf.currentTerm {
-		return 0
-	} else {
-		return -1
-	}
+	VoteGranted bool // true表示收到了投票
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	mylog(rf.getStateDescription(), "收到RequestVote RPC")
+	if DEBUG_RAFT {
+		rf.Lock()
+		mylog(rf.getStatusInfo(), "收到RequestVote RPC")
+		rf.Unlock()
+	}
 
 	// Your code here (2A, 2B).
 
-	rf.incRequestVoteCount()
-
 	// All Servers : If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-
 	// 1. Reply false if term < currentTerm (§5.1)
+	// 2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
 
-	flag := rf.checkRequestVoteTerm(args)
-
-	if flag < 0 { // 参数的任期更低
-		reply.Term = rf.getCurrentTerm()
-		reply.VoteGranted = false
-	} else { // 任期相等
-		// 2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
-		if rf.voteForCandidate(args.CandidateId) {
-			reply.Term = rf.getCurrentTerm()
-			reply.VoteGranted = true
-			return
-		}
+	rf.Lock()
+	
+	if args.Term > rf.currentTerm {
+		// 对方任期更高
+		mylog(rf.getStatusInfo(), "RequestVote RPC发现更高Raft[", args.CandidateId, "]任期[", args.Term, "]，切换到Follower")
+		rf.disconverHigherTerm(args.Term)
 	}
 
-	reply.Term = rf.getCurrentTerm()
-	reply.VoteGranted = false
-}
+	if args.Term < rf.currentTerm {
+		// 对方任期更低
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+	} else {
+		// 任期相等
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = rf.voteForCandidate(args)
+	}
 
-type LogEntry struct {
-	Term  int
-	Index int
+	rf.Unlock()
 }
 
 type AppendEntriesArgs struct {
@@ -339,7 +367,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int // Entries[]前面的一个日志索引
 	PrevLogTerm  int // Entries[]前面的一个日志任期
 	Entries      []LogEntry
-	LeaderCommit int // Leader提交的日志索引
+	LeaderCommit int // Leader的commitIndex
 }
 
 type AppendEntriesReply struct {
@@ -347,53 +375,47 @@ type AppendEntriesReply struct {
 	Success bool // true表示Follower匹配
 }
 
-// 参数的term大于当前任期，返回1，相等返回0，小于返回-1
-func (rf *Raft) checkAppendEntriesTerm(args *AppendEntriesArgs) int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = NULL_CANDIDATE_ID
-		mylog(rf.getStateDescription2(), "，AppendEntries RPC发现更高Raft[", args.LeaderId, "]任期[", args.Term, "]，切换到Follower")
-		go rf.convertToState(STATE_FOLLOWER)
-		return 1
-	} else if args.Term == rf.currentTerm {
-		return 0
-	} else {
-		return -1
-	}
-}
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	//mylog(rf.getStateDescription(), "收到AppendEntries RPC")
-
-	rf.incAppendEntriesCount()
+	if DEBUG_RAFT {
+		rf.Lock()
+		mydebug(rf.getStatusInfo(), "收到AppendEntries RPC")
+		rf.Unlock()
+	}
 	
 	// All Servers : If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-
 	// 1. Reply false if term < currentTerm (§5.1)
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm (§5.3)
+	// 3. If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it (§5.3)
+	// 4. Append any new entries not already in the log
+	// 5. If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
 
-	flag := rf.checkAppendEntriesTerm(args)
+	rf.Lock()
 	
-	if flag > 0 { // 参数的任期更高
-		reply.Term = rf.getCurrentTerm()
-		reply.Success = false
-	} else if flag < 0 { // 参数的任期更低
-		reply.Term = rf.getCurrentTerm()
-		reply.Success = false
-	} else { // 任期相等
-		// 2. Reply false if log doesn’t contain an entry at prevLogIndex
-		// whose term matches prevLogTerm (§5.3)
-
-		// 3. If an existing entry conflicts with a new one (same index
-		// but different terms), delete the existing entry and all that
-		// follow it (§5.3)
-
-		// 4. Append any new entries not already in the log
-
-		// 5. If leaderCommit > commitIndex, set commitIndex =
-		// min(leaderCommit, index of last new entry)
+	if args.Term > rf.currentTerm {
+		// 对方任期更高
+		mylog(rf.getStatusInfo(), "AppendEntries RPC发现更高Raft[", args.CandidateId, "]任期[", args.Term, "]，切换到Follower")
+		rf.disconverHigherTerm(args.Term)
 	}
+
+	if args.Term < rf.currentTerm {
+		// 对方任期更低
+		reply.Term = rf.currentTerm
+		reply.Success = false
+	} else {
+		// 任期相等
+
+		// 从当前Leader收到了一个AppendEntries RPC
+		rf.resetElectionTimerForLeader()
+		
+		reply.Term = rf.currentTerm
+		reply.Success = false
+	}
+
+	rf.Unlock()
 }
 
 //
@@ -468,7 +490,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
 
-	rf.setState(STATE_KILLED)
+	rf.Lock()
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfo(), "Kill")
+	}
+	rf.state = STATE_KILLED
+	rf.logicalClock++
+	rf.Unlock()
+	
 }
 
 //
@@ -490,216 +519,189 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	
 	rf.logicalClock = 0
-	rf.appendEntriesCount = 0
-	rf.requestVoteCount = 0
+	rf.resetElectionTimer()
 	rf.state = STATE_FOLLOWER
 	rf.currentTerm = 0
-	rf.votedFor = NULL_CANDIDATE_ID
+	rf.votedFor = NULL_PEER_ID
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.startState(STATE_FOLLOWER)
+	// 一个线程用于定时检查选举是否超时
+	go rf.handleElectionTimer
+	
+	// 一个线程用于定时发送心跳
+	go rf.handleHeartbeat()
+	
+	// 一个线程用于把已经提交的日志发送到applyCh
+	
+	// 一个线程用于apply
 
 	return rf
 }
 
-func (rf *Raft) internalStartNewState(state int) {
-	rf.state = state
-	rf.logicalClock++
-
-	if state == STATE_FOLLOWER {
-		go rf.startFollower(rf.logicalClock)
-	} else if state == STATE_CANDIDATE {
-		go rf.startCandidate(rf.logicalClock)
-	} else if state == STATE_LEADER {
-		go rf.startLeader(rf.logicalClock)
+func (rf *Raft)handleElectionTimer() {
+	mydebug(rf.getStatusInfoByLock(), "开始选举超时检查线程")
+	
+	for {
+		rf.Lock()
+		if rf.state == STATE_KILLED {
+			break
+		} else if rf.state == STATE_FOLLOWER {
+			if rf.isElectionTimeout() {
+				// 转成候选人
+				rf.convertToState(STATE_CANDIDATE)
+			}
+		} else if rf.state == STATE_CANDIDATE {
+			if rf.isElectionTimeout() {
+				// 发起新的选举
+				rf.startNewElection()
+			}
+		}
+		rf.Unlock()
+		
+		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
 	}
-}
-
-// 开始状态，不管之前的状态是什么
-func (rf *Raft) startState(state int) {
-	mylog(rf.getStateDescription(), "，开始状态--->", stateToString(state))
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.state != STATE_KILLED {
-		rf.internalStartNewState(state)
-	} else {
-		mylog(rf.getStateDescription2(), ",已经终止：", stateToString(state))
-	}
+	
+	mydebug(rf.getStatusInfoByLock(), "结束选举超时检查线程")
 }
 
 // 转换到状态，当之前的状态和新状态一样时，不做任何处理
 func (rf *Raft) convertToState(state int) {
-	mylog(rf.getStateDescription(), "，转换状态到--->", stateToString(state))
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfo(), "转换状态到--->", stateToString(state))
+	}
 
 	if rf.state != state {
+		rf.logicalClock++
 		rf.internalStartNewState(state)
 	} else {
-		mylog(rf.getStateDescription2(), ",不用转换状态，因为状态一致：", stateToString(state))
+		mydebug(rf.getStatusInfo(), ",不用转换状态，因为状态一致：", stateToString(state))
 	}
 }
 
-// 开始状态，当逻辑时钟一致时
-func (rf *Raft) startStateByLogicalClock(state int, logicalClock int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+// 候选人发起新的选举
+func (rf *Raft)startNewElection() {
+	// • Increment currentTerm
+	// • Vote for self
+	// • Reset election timer
+	// • Send RequestVote RPCs to all other servers
 
-	if logicalClock == rf.logicalClock {
-		rf.internalStartNewState(state)
-	} else {
-		mylog(rf.getStateDescription2(), ",不能改变状态，因为logicalClock:", logicalClock)
-	}
-}
+	rf.currentTerm++
+	rf.logicalClock++
+	rf.votedFor = rf.me
+	rf.resetElectionTimer()
 
-func (rf *Raft) startFollower(logicalClock int) {
-	rf.setAppendEntriesCount(0)
-	rf.setRequestVoteCount(0)
-
-	duration := rf.getElectionTimeout()
-	electionTimeoutTimer := time.NewTimer(duration)
-	<-electionTimeoutTimer.C
-
-	if rf.getState() != STATE_KILLED {
-		aeCount := rf.getAppendEntriesCount()
-		veCount := rf.getRequestVoteCount()
-		votedFor := rf.getVotedFor()
-		mylog(rf.getStateDescription(), "在", duration, "毫秒之后选举超时,AppendEntries RPC个数:", aeCount, "，RequestVote RPC个数:", veCount, "，VotedFor:",votedFor)
-
-		// If election timeout elapses without receiving AppendEntries
-		// RPC from current leader or granting vote to candidate:
-		// convert to candidate
-		if aeCount == 0 && veCount == 0 {
-			mylog(rf.getStateDescription(), "切换到", stateToString(STATE_CANDIDATE))
-			go rf.startStateByLogicalClock(STATE_CANDIDATE, logicalClock)
-		} else {
-			mylog(rf.getStateDescription(), "继续保持", stateToString(STATE_FOLLOWER))
-			go rf.startStateByLogicalClock(STATE_FOLLOWER, logicalClock)
-		}
-	} else {
-		mylog(rf.getStateDescription(), "已经终止")
-	}
-}
-
-func (rf *Raft) startCandidate(logicalClock int) {
-	rf.incCurrentTerm() // 	Increment currentTerm
-	rf.voteForSelf()    //  Vote for self
-
-	// Reset election timer
-	duration := rf.getElectionTimeout()
-	electionTimeoutTimer := time.NewTimer(duration)
-
-	voteChan := make(chan int, len(rf.peers))
-	voteArgs := RequestVoteArgs{
-		Term:         rf.getCurrentTerm(),
-		CandidateId:  rf.getVotedFor(),
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.votedFor,
 		LastLogIndex: 0,
-		LastLogTerm:  0}
-	var replyList []RequestVoteReply
-
-	for i := 0; i < len(rf.peers); i++ {
-		replyList = append(replyList, RequestVoteReply{})
+		LastLogTerm:  0,
 	}
+	voteCount := 0
 
 	// Send RequestVote RPCs to all other servers
 	for i := 0; i < len(rf.peers); i++ {
-		go func(server int) {
-			mylog(rf.getStateDescription(), ",开始向服务器", server, "发送RequestVote RPC")
-			ok := rf.sendRequestVote(server, &voteArgs, &replyList[server])
-			voteChan <- server
-			mylog(rf.getStateDescription(), ",结束向服务器", server, "发送RequestVote RPC,", ok)
+		go func(server int, logicalClock int) {
+			reply := RequestVoteReply{}
 
-		}(i)
-	}
+			mydebug(rf.getStatusInfoByLock(), ",开始向服务器", server, "发送RequestVote RPC")
+			ok := rf.sendRequestVote(server, &args, &reply)
+			mydebug(rf.getStatusInfoByLock(), ",结束向服务器", server, "发送RequestVote RPC,", ok)
 
-	vote := 0
-	voteCount := 0
+			if ok && reply.VoteGranted {
+				voteCount++
+				majority := len(rf.peers)/2 + 1
+				if voteCount >= majority {
+					// 收到多数派投票
+					mydebug("多数派个数:", majority)
+					mydebug(rf.getStatusInfoByLock(), "收到多数派投票：", voteCount, "/", total, "，VotedFor:", rf.getVotedFor())
 
-	for done := false; !done; {
-		select {
-		case <-electionTimeoutTimer.C:
-			// 超时了
-			done = true
-			if rf.getState() != STATE_KILLED {
-				rf.afterCandidateElectionTimeout(logicalClock, duration)
-			}
-		case vote = <-voteChan:
-			if rf.getState() != STATE_KILLED {
-				// 第N个RPC返回了
-				if replyList[vote].VoteGranted {
-					voteCount++
-					majority := len(rf.peers)/2 + 1
-					if voteCount >= majority {
-						// 收到多数派投票
-						done = true
-						mylog("多数派个数:", majority)
-						rf.afterCandidateRecvMajorityVote(logicalClock, voteCount, len(rf.peers))
+					rf.Lock()
+					if args.Term == rf.currentTerm {
+						mydebug(rf.getStatusInfo(), "切换到", stateToString(STATE_LEADER))
+						rf.convertToState(STATE_LEADER)
+					} else{
+						// 期间任期发生了变化，忽略
+						mydebug(rf.getStatusInfo(), "发送投票期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
 					}
+					rf.Unlock()
 				}
-			} else {
-				done = true
-				mylog(rf.getStateDescription(), "已经终止")
+			}
+		}(i, rf.logicalClock)
+	}
+}
+
+func (rf *Raft) internalStartNewState(state int) {
+	rf.state = state
+
+	if state == STATE_FOLLOWER {
+		// 
+	} else if state == STATE_CANDIDATE {
+		rf.startNewElection()
+	} else if state == STATE_LEADER {
+		// 
+	}
+}
+
+// 发现了更新任期
+func (rf *Raft)disconverHigherTerm(higherTerm int) {
+	rf.currentTerm = higherTerm
+	rf.votedFor = NULL_PEER_ID
+	rf.logicalClock++
+
+	if rf.state != state {
+		mylog(rf.getStatusInfo(), "转换状态到--->", stateToString(STATE_FOLLOWER))
+		rf.internalStartNewState(STATE_FOLLOWER)
+	} else {
+		mylog(rf.getStatusInfo(), "不用转换状态，因为状态一致：", stateToString(STATE_FOLLOWER))
+	}
+}
+
+func (rf *Raft)handleHeartbeat() {
+	mydebug(rf.getStatusInfoByLock(), "开始心跳检查线程")
+	
+	for {
+		rf.Lock()
+		if rf.state == STATE_KILLED {
+			break
+		} else if rf.state == STATE_LEADER {
+			if rf.isHeartbeatTimeout() {
+				// 心跳超时
+				rf.sendHeartbeat()
 			}
 		}
+		rf.Unlock()
+		
+		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
 	}
-}
-func (rf *Raft) afterCandidateElectionTimeout(logicalClock int, duration time.Duration) {
-	mylog(rf.getStateDescription(), "在", duration, "毫秒之后选举超时,AppendEntries RPC个数:", rf.getAppendEntriesCount(), "，RequestVote RPC个数:", rf.getRequestVoteCount(), "，VotedFor:", rf.getVotedFor())
-
-	mylog(rf.getStateDescription(), "继续保持", stateToString(STATE_CANDIDATE))
-	go rf.startStateByLogicalClock(STATE_CANDIDATE, logicalClock)
-}
-func (rf *Raft) afterCandidateRecvMajorityVote(logicalClock int, voteCount int, total int) {
-	mylog(rf.getStateDescription(), "收到多数派投票：", voteCount, "/", total, ",AppendEntries RPC个数:", rf.getAppendEntriesCount(), "，RequestVote RPC个数:", rf.getRequestVoteCount(), "，VotedFor:", rf.getVotedFor())
-
-	mylog2(rf.getStateDescription(), "切换到", stateToString(STATE_LEADER))
-	go rf.startStateByLogicalClock(STATE_LEADER, logicalClock)
+	
+	mydebug(rf.getStatusInfoByLock(), "结束心跳检查线程")
 }
 
-func (rf *Raft) startLeader(logicalClock int) {
-	// Upon election: send initial empty AppendEntries RPCs
-	// (heartbeat) to each server; repeat during idle periods to
-	// prevent election timeouts (§5.2)
-
-	go rf.startLeaderSendHeartbeatTimer()
-
-}
-func (rf *Raft) startLeaderSendHeartbeatTimer() {
+func (rf *Raft)sendHeartbeat() {
 	args := AppendEntriesArgs{
-		Term:         rf.getCurrentTerm(),
+		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
 		Entries:      []LogEntry{},
 		LeaderCommit: 0,
 	}
-	replyList := make([]AppendEntriesReply, len(rf.peers))
 
 	for i := 0; i < len(rf.peers); i++ {
 		go func(server int) {
-			//mylog("开始向服务器", server, "发送心跳信息AppendEntries RPC")
-			rf.sendAppendEntries(server, &args, &replyList[server])
-			//mylog("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
-
+			reply := AppendEntriesReply{}
+			
+			mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
 		}(i)
 	}
 
-	duration := rf.getHeartbeatTimeout()
-	timer := time.NewTimer(duration)
-	<-timer.C
-
-	//mylog(rf.getStateDescription(), "在", duration, "毫秒之后心跳超时,AppendEntries RPC个数:", rf.getAppendEntriesCount(), "，RequestVote RPC个数:", rf.getRequestVoteCount(), "，VotedFor:", rf.getVotedFor())
-
-	if rf.getState() != STATE_KILLED {
-		go rf.startLeaderSendHeartbeatTimer()
-	} else {
-		mylog(rf.getStateDescription(), "已经终止")
-	}
+	rf.lastHeartbeatTimestamp := time.Now()
 }

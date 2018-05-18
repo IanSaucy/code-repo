@@ -22,7 +22,6 @@ import "labrpc"
 import "time"
 import "math/rand"
 import "fmt"
-import "sync/atomic"
 
 // import "bytes"
 // import "labgob"
@@ -89,6 +88,9 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// 当收到客户端请求时，通知日志复制处理线程
+	logReplicationConds []*sync.Cond
+	
 	// 开始新状态之前，必须保证之前开始的旧状态的代码不起作用
 	// 所有的相关代码必须只能在逻辑时钟相同的情况起作用
 	// 当任期发生变化，或者状态发生变化，逻辑时钟递增
@@ -161,25 +163,8 @@ func (rf *Raft)Unlock() {
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) getLogicalClock() int {
-	rf.Lock()
-	defer rf.Unlock()
-	return rf.logicalClock
-}
-func (rf *Raft) getState() int {
-	rf.Lock()
-	defer rf.Unlock()
-	return rf.state
-}
-func (rf *Raft) getCurrentTerm() int {
-	rf.Lock()
-	defer rf.Unlock()
-	return rf.currentTerm
-}
-func (rf *Raft) getVotedFor() int {
-	rf.Lock()
-	defer rf.Unlock()
-	return rf.votedFor
+func (rf *Raft)getMajorityNum() int {
+	return len(rf.peers)/2 + 1
 }
 
 // 比较自己的日志和对方的日志，返回1表示自己的更新；返回0表示一样新；返回-1表示自己的更旧；
@@ -466,15 +451,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft)getNewLogIndex() int {
-	n := len(rf.log)
-	if n > 0 {
-		return rf.log[n - 1].Index + 1
-	} else {
-		return 1
-	}
-}
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -500,36 +476,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 	} else {
 		// 领导人把这条命令作为新的日志条目加入到它的日志中去，
-		// 然后并行的向其他服务器发起 AppendEntries RPC ，要求其它服务器复制这个条目。
-		// 当这个条目被安全的复制之后，领导人会将这个条目应用到它的状态机中并且会向客户端返回执行结果。
+		// 然后通知日志复制线程
+
+		logSize := len(rf.log)
+		newLogIndex := 1 // 日志索引从1开始
+		
+		if logSize > 0 {
+			newLogIndex = rf.log[logSize - 1].Index + 1
+		}
 		
 		newLogEntry := LogEntry{
 			Term : rf.currentTerm,
-			Index : rf.getNewLogIndex(),
+			Index : newLogIndex,
 			Command : command,
 		}
 		rf.log = append(rf.log, newLogEntry)
-		
-		args := AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      []LogEntry{},
-		LeaderCommit: 0,
-	}
 
-	for i := 0; i < len(rf.peers); i++ {
-		go func(server int) {
-			reply := AppendEntriesReply{}
-			
-			mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
-		}(i)
-	}
+		index = newLogIndex
+		term = rf.currentTerm
 
-	rf.lastHeartbeatTimestamp = time.Now()
+		for i := 0; i < len(rf.peers); i++ {
+			rf.logReplicationConds[i].Signal()
+		}
 	}
 	rf.Unlock()
 
@@ -546,12 +514,17 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 
 	rf.Lock()
+	defer rf.Unlock()
+	
 	if DEBUG_RAFT {
 		mylog(rf.getStatusInfo(), "Kill")
 	}
 	rf.state = STATE_KILLED
 	rf.logicalClock++
-	rf.Unlock()
+
+	for i := 0; i < len(rf.peers); i++ {
+		rf.logReplicationConds[i].Signal()
+	}
 	
 }
 
@@ -574,6 +547,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+
+	rf.logReplicationConds = make([]*sync.Cond, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		locker := new(sync.Mutex)
+		rf.logReplicationConds[i] = sync.NewCond(locker)
+	}
 	
 	rf.logicalClock = 0
 	rf.resetElectionTimer()
@@ -594,6 +573,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	
 	// 一个线程用于定时发送心跳
 	go rf.handleHeartbeat()
+
+	// 对于每一个服务器开启一个线程用于发送日志
+	for i := 0; i < len(rf.peers); i++ {
+		go rf.handleLogReplication(i)
+	}
 	
 	// 一个线程用于把已经提交的日志发送到applyCh
 	
@@ -604,22 +588,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft)handleElectionTimer() {
 	mydebug(rf.getStatusInfoByLock(), "开始选举超时检查线程")
-	
+
 	for {
 		rf.Lock()
+		
 		if rf.state == STATE_KILLED {
+			rf.Unlock()
 			break
-		} else if rf.state == STATE_FOLLOWER {
-			if rf.isElectionTimeout() {
-				// 转成候选人
-				rf.convertToState(STATE_CANDIDATE)
-			}
-		} else if rf.state == STATE_CANDIDATE {
-			if rf.isElectionTimeout() {
-				// 发起新的选举
-				rf.startNewElection()
-			}
+		} else if rf.state == STATE_FOLLOWER && rf.isElectionTimeout() {
+			// 转成候选人
+			rf.convertToState(STATE_CANDIDATE)
+		} else if rf.state == STATE_CANDIDATE && rf.isElectionTimeout() {
+			// 发起新的选举
+			rf.startNewElection()
 		}
+		
 		rf.Unlock()
 		
 		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
@@ -660,7 +643,7 @@ func (rf *Raft)startNewElection() {
 		LastLogIndex: 0,
 		LastLogTerm:  0,
 	}
-	var voteCount int32  = 0
+	var voteCount int  = 0
 
 	// Send RequestVote RPCs to all other servers
 	for i := 0; i < len(rf.peers); i++ {
@@ -671,28 +654,32 @@ func (rf *Raft)startNewElection() {
 			ok := rf.sendRequestVote(server, &args, &reply)
 			mydebug(rf.getStatusInfoByLock(), ",结束向服务器", server, "发送RequestVote RPC,", ok)
 
-			if ok && reply.VoteGranted {
-				count := atomic.AddInt32(&voteCount, 1)
-				majority := int32(len(rf.peers)/2 + 1)
-				if count  >= majority {
-					// 收到多数派投票
-					mydebug("多数派个数:", majority)
-					mydebug(rf.getStatusInfoByLock(), "收到多数派投票：", count, "/", len(rf.peers), "，VotedFor:", rf.getVotedFor())
+			if !ok {
+				return
+			}
+			if !reply.VoteGranted {
+				return
+			}
+			
+			rf.Lock()
+			defer rf.Unlock()
 
-					rf.Lock()
-					if args.Term == rf.currentTerm {
-						mydebug(rf.getStatusInfo(), "切换到", stateToString(STATE_LEADER))
-						rf.convertToState(STATE_LEADER)
-					} else{
-						// 期间任期发生了变化，忽略
-						mydebug(rf.getStatusInfo(), "发送投票期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
-					}
-					rf.Unlock()
-				}
+			if args.Term != rf.currentTerm {
+				// 期间任期发生了变化，忽略
+				mydebug(rf.getStatusInfo(), "发送投票期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
+				return
+			}
+
+			voteCount++
+			if voteCount == rf.getMajorityNum() {
+				// 收到多数派投票
+				mydebug(rf.getStatusInfo(), "收到多数派投票：", voteCount, "/", len(rf.peers), "，VotedFor:", rf.votedFor, "，切换到", stateToString(STATE_LEADER))
+				rf.convertToState(STATE_LEADER)
 			}
 		}(i)
 	}
 }
+
 
 func (rf *Raft) internalStartNewState(state int) {
 	rf.state = state
@@ -732,14 +719,15 @@ func (rf *Raft)handleHeartbeat() {
 	
 	for {
 		rf.Lock()
+	
 		if rf.state == STATE_KILLED {
+			rf.Unlock()
 			break
-		} else if rf.state == STATE_LEADER {
-			if rf.isHeartbeatTimeout() {
-				// 心跳超时
-				rf.sendHeartbeat()
-			}
+		} else if rf.state == STATE_LEADER && rf.isHeartbeatTimeout() {
+			// 心跳超时
+			rf.sendHeartbeat()
 		}
+
 		rf.Unlock()
 		
 		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
@@ -757,33 +745,68 @@ func (rf *Raft)sendHeartbeat() {
 
 	rf.lastHeartbeatTimestamp = time.Now()
 }
+
+func (rf *Raft)handleLogReplication(server int) {
+	mydebug(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
+
+	for {
+		rf.logReplicationConds[i].Wait()
+		
+		rf.Lock()
+		
+		if rf.state == STATE_KILLED {
+			rf.Unlock()
+			break
+		} else if rf.state == STATE_LEADER {
+			rf.sendAppenEntriesRPC(server)
+		}
+		
+		rf.Unlock()
+	}
+	
+	mydebug(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
+}
+func (rf *Raft)sendAppenEntriesRPC(server int) {
+	args := AppendEntriesArgs{
+		Term : rf.currentTerm,
+		LeaderId : rf.me,
+		PrevLogIndex : prevLogIndex, 
+		PrevLogTerm : prevLogTerm,
+		Entries : entries,
+		LeaderCommit : rf.commitIndex,
+	}
+	reply := AppendEntriesReply{}
+			
+	mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
+
+	if !ok {
+		return
+	}
+			
+	rf.Lock()
+	defer rf.Unlock()
+
+	if args.Term != rf.currentTerm {
+		// 期间任期发生了变化，忽略
+		mydebug(rf.getStatusInfo(), "发送日志期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
+		return
+	}
+				
+	if reply.Success {
+
+	} else {
+
+	}
+}
+
 func (rf *Raft)sendHeartbeatToServer(server int) {
 	rf.Lock()
 	defer rf.Unlock()
 
 	if rf.state == STATE_LEADER {
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: 0,
-			PrevLogTerm:  0,
-			Entries:      []LogEntry{},
-			LeaderCommit: rf.commitIndex,
-		}
-
-		go func() {
-			reply := AppendEntriesReply{}	
-			mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
-
-			if ok {
-				if reply.Success {
-				
-				} else {
-
-				}
-			}
-		}()
+		rf.sendAppenEntriesRPC(server)
 	}
 }
+

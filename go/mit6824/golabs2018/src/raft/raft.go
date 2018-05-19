@@ -54,10 +54,10 @@ const NULL_PEER_ID int = -1
 
 // 无效的任期
 const NULL_TERM = 0
-// 无效的日志索引
-const NULL_LOG_INDEX = 0
 // 第一个日志索引
 const FIRST_LOG_INDEX = 1
+// 无效的日志索引
+const NULL_LOG_INDEX = FIRST_LOG_INDEX - 1
 
 // 超时时间
 const HEARTBEAT_TIMEOUT = 100
@@ -94,6 +94,8 @@ type Raft struct {
 	logReplicationConds []*sync.Cond
 	// commitIndex更新的信号量
 	commitIndexCond *sync.Cond
+
+	recvCommandLogIndex []int // 记录Leade接收的日志索引
 	
 	// 开始新状态之前，必须保证之前开始的旧状态的代码不起作用
 	// 所有的相关代码必须只能在逻辑时钟相同的情况起作用
@@ -172,7 +174,7 @@ func (rf *Raft)getMajorityNum() int {
 }
 
 func (rf *Raft)getLastLogIndex() int {
-	logSize := len(rf.peers)
+	logSize := len(rf.log)
 
 	if logSize > 0 {
 		return rf.log[logSize - 1].Index
@@ -185,25 +187,25 @@ func (rf *Raft)logIndexToLogArrayIndex(v int) int {
 	logSize := len(rf.log)
 
 	if logSize > 0 {
-		return arrayIndex := v - rf.log[0].Index
+		return v - rf.log[0].Index
 	} else {
 		return -1
 	}	
 }
 
-func (rf *Raft)getPrevLogTermAndIndex(v int) (int, int) {
+func (rf *Raft)getLogTermByLogIndex(v int) int {
 	logSize := len(rf.log)
 
 	if logSize > 0 {
 		arrayIndex := rf.logIndexToLogArrayIndex(v)
 
-		if arrayIndex > 0 {
-			return rf.log[arrayIndex - 1].Term, rf.log[arrayIndex - 1].Index
+		if arrayIndex >= 0 {
+			return rf.log[arrayIndex].Term
 		} else {
-			return NULL_TERM, NULL_LOG_INDEX	
+			return NULL_TERM	
 		}
 	} else {
-		return NULL_TERM, NULL_LOG_INDEX
+		return NULL_TERM
 	}
 }
 
@@ -428,6 +430,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// min(leaderCommit, index of last new entry)
 
 	rf.Lock()
+	defer rf.Unlock()
 	
 	if args.Term > rf.currentTerm {
 		// 对方任期更高
@@ -444,12 +447,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// 从当前Leader收到了一个AppendEntries RPC
 		rf.resetElectionTimerForLeader()
-		
-		reply.Term = rf.currentTerm
-		reply.Success = false
-	}
 
-	rf.Unlock()
+		prevLogArrayIndex := rf.logIndexToLogArrayIndex(args.PrevLogIndex)
+		if prevLogArrayIndex >= len(rf.log) { // 超了
+			reply.Term = rf.currentTerm
+			reply.Success = false
+		} else if prevLogArrayIndex < 0 {
+			// 说明日志不在rf.log中，在没有快照的情况下，说明这是不存在的日志
+			reply.Term = rf.currentTerm
+			reply.Success = true
+		} else {
+			if rf.log[prevLogArrayIndex].Term == args.PrevLogTerm {
+				reply.Term = rf.currentTerm
+				reply.Success = true
+			} else {
+				reply.Term = rf.currentTerm
+				reply.Success = false
+			}
+		}
+	}
 }
 
 //
@@ -527,12 +543,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		rf.log = append(rf.log, newLogEntry)
 
+		rf.recvCommandLogIndex = append(rf.recvCommandLogIndex, newLogIndex)
+		
 		index = newLogIndex
 		term = rf.currentTerm
 
-		for i := 0; i < len(rf.peers); i++ {
-			rf.logReplicationConds[i].Signal()
-		}
+		go func() {
+			for i := 0; i < len(rf.peers); i++ {
+				rf.logReplicationConds[i].L.Lock()
+				rf.logReplicationConds[i].Signal()
+				rf.logReplicationConds[i].L.Unlock()
+			}
+		}()
 	}
 	rf.Unlock()
 
@@ -617,9 +639,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	
 	// 一个线程用于把已经提交的日志发送到applyCh
-	go handleSendApplych(applyCh)
+	go rf.handleSendApplyCh(applyCh)
 	
 	// 一个线程用于apply
+	go rf.handleLogApply()
 
 	return rf
 }
@@ -711,7 +734,7 @@ func (rf *Raft)startNewElection() {
 			voteCount++
 			if voteCount == rf.getMajorityNum() {
 				// 收到多数派投票
-				mydebug(rf.getStatusInfo(), "收到多数派投票：", voteCount, "/", len(rf.peers), "，VotedFor:", rf.votedFor, "，切换到", stateToString(STATE_LEADER))
+				mylog(rf.getStatusInfo(), "收到多数派投票：", voteCount, "/", len(rf.peers), "，VotedFor:", rf.votedFor, "，切换到", stateToString(STATE_LEADER))
 				rf.convertToState(STATE_LEADER)
 			}
 		}(i)
@@ -789,11 +812,11 @@ func (rf *Raft)sendHeartbeat() {
 func (rf *Raft)handleLogReplication(server int) {
 	mylog(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
 
+	rf.logReplicationConds[server].L.Lock()
+
 	for {
-		rf.logReplicationConds[i].L.Lock()
-		rf.logReplicationConds[i].Wait()
-		rf.logReplicationConds[i].L.Unlock()
-		
+		rf.logReplicationConds[server].Wait()
+
 		rf.Lock()
 		
 		if rf.state == STATE_KILLED {
@@ -801,32 +824,36 @@ func (rf *Raft)handleLogReplication(server int) {
 			break
 		} else if rf.state == STATE_LEADER {
 			if server != rf.me {
-				rf.sendAppenEntriesRPC(server)
+				rf.sendAppendEntriesRPC(server)
 			}
 		}
 		
 		rf.Unlock()
 	}
+		
+	rf.logReplicationConds[server].L.Unlock()
 	
 	mylog(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
 }
-func (rf *Raft)sendAppenEntriesRPC(server int) {
+func (rf *Raft)sendAppendEntriesRPC(server int) {
 	// If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
 	//   If successful: update nextIndex and matchIndex for follower (§5.3)
 	//   If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
 
-	logSize := len(rf.log)
-	prevLogTerm, prevLogIndex := rf.getPrevLogTermAndIndex(rf.nextIndex[server])
+	prevLogIndex := rf.nextIndex[server] - 1
+	prevLogTerm := rf.getLogTermByLogIndex(prevLogIndex)
 	entries := []LogEntry{}
 	lastLogIndex := rf.getLastLogIndex()
 
+	mylog(rf.getStatusInfo(), "Server:", server, ",lastLogIndex:", lastLogIndex, ",nextIndex:", rf.nextIndex[server])
 	if lastLogIndex >= rf.nextIndex[server] {
 		start := rf.nextIndex[server]
 		end := lastLogIndex
 		entries = make([]LogEntry, end - start + 1)
 
-		for i := 0; start <= end; i++, start++ {
+		for i := 0; start <= end; i++ {
 			entries[i] = rf.log[start]
+			start++
 		}
 	}
 	
@@ -850,20 +877,26 @@ func (rf *Raft)sendAppenEntriesRPC(server int) {
 			rf.Lock()
 			defer rf.Unlock()
 
+			mylog(rf.getStatusInfo(), "收到AppendEntriesReply:", reply)
+			
 			if args.Term != rf.currentTerm {
 				// 期间任期发生了变化，忽略
 				mydebug(rf.getStatusInfo(), "发送日志期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
 			} else if reply.Success {
 				// 成功
 				rf.nextIndex[server] = rf.getLastLogIndex() + 1
-				rf.matchIndex[server] = args.prevLogIndex + len(args.Entries)
+				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 
 				// 尝试更新Leader的commitIndex
 				rf.tryUpdateLeaderCommitIndex()
 			} else {
 				// 失败
-				rf.nextIndex[server]--
-				rf.logReplicationConds[server].Signal()
+				if args.Term == reply.Term {
+					rf.nextIndex[server]--
+					rf.logReplicationConds[server].Signal()
+				} else {
+					mylog(rf.getStatusInfo(), "收到跟参数任期[", args.Term, "]不一致的任期[", reply.Term, "]，忽略")	
+				}
 			}
 		}
 	}()
@@ -877,7 +910,7 @@ func (rf *Raft)tryUpdateLeaderCommitIndex() {
 	k := rf.logIndexToLogArrayIndex(n)
 	maxN := NULL_LOG_INDEX
 
-	for n <= lastLogIndex; n++, k++ {
+	for ; n <= lastLogIndex; n++ {
 		count := 0
 		
 		for i := 0; i < len(rf.peers); i++ {
@@ -893,11 +926,18 @@ func (rf *Raft)tryUpdateLeaderCommitIndex() {
 		if n >= rf.getMajorityNum() {
 			maxN = n
 		}
+
+		k++
 	}
 
 	if maxN != NULL_LOG_INDEX {
 		rf.commitIndex = maxN
-		rf.commitIndexCond.Broadcast()
+
+		go func() {
+			rf.commitIndexCond.L.Lock()
+			rf.commitIndexCond.Broadcast()
+			rf.commitIndexCond.L.Unlock()
+		}()
 	}
 }
 
@@ -906,19 +946,18 @@ func (rf *Raft)sendHeartbeatToServer(server int) {
 	defer rf.Unlock()
 
 	if rf.state == STATE_LEADER {
-		rf.sendAppenEntriesRPC(server)
+		rf.sendAppendEntriesRPC(server)
 	}
 }
 
 func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 	mylog(rf.getStatusInfoByLock(), "开始发送ApplyCh线程")
 
-	nextSendIndex := rf.getLastLogIndex() + 1
-	
+	rf.commitIndexCond.L.Lock()
+
 	for {
-		rf.commitIndexCond.L.Lock()
+		// 解锁，并等待
 		rf.commitIndexCond.Wait()
-		rf.commitIndexCond.L.Unlock()
 		
 		rf.Lock()
 		
@@ -926,14 +965,58 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 			rf.Unlock()
 			break
 		} else if rf.state == STATE_LEADER {
-			arrayIndex := rf.logIndexToArrayIndex(nextSendIndex)
-
-			
+			for i := 0; i < len(rf.recvCommandLogIndex); i++ {
+				if rf.recvCommandLogIndex[i]<= rf.commitIndex {
+					arrayIndex := rf.logIndexToLogArrayIndex(rf.recvCommandLogIndex[i])
+					applyCh <- ApplyMsg{
+						CommandValid : true,
+						Command      : rf.log[arrayIndex].Command,
+						CommandIndex : rf.log[arrayIndex].Index,
+					}
+				} else {
+					rf.recvCommandLogIndex =rf.recvCommandLogIndex[i:]
+					break
+				}
+			}
 		}
 		
 		rf.Unlock()
 	}
 	
+	rf.commitIndexCond.L.Unlock()
+	
 	mylog(rf.getStatusInfoByLock(), "结束发送ApplyCh线程")	
 }
 
+func (rf *Raft)handleLogApply() {
+	mylog(rf.getStatusInfoByLock(), "开始日志Apply线程")
+	
+	rf.commitIndexCond.L.Lock()
+
+	for {
+		// 解锁，并等待
+		rf.commitIndexCond.Wait()
+		
+		rf.Lock()
+		
+		if rf.state == STATE_KILLED {
+			rf.Unlock()
+			break
+		} else {
+			for i := rf.logIndexToLogArrayIndex(rf.lastApplied + 1); i < len(rf.log); i++ {
+				if rf.log[i].Index<= rf.commitIndex {
+					mylog(rf.getStatusInfo(), "把任期[", rf.log[i].Term, "]索引[", rf.log[i].Index, "]的日志应用到状态机中")
+					rf.lastApplied = rf.log[i].Index
+				} else {
+					break
+				}
+			}
+		}
+		
+		rf.Unlock()
+	}
+	
+	rf.commitIndexCond.L.Unlock()
+	
+	mylog(rf.getStatusInfoByLock(), "结束日志Apply线程")	
+}

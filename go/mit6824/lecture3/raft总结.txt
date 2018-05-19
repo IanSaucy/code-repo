@@ -56,9 +56,10 @@ AppendEntries RPC
 
 优化
 	日志压缩
-		
+		快照	
 	加速日志回溯
 		AppendEntries RPC检查Follower的日志不匹配时，一种办法是每次减1，这个可以优化。
+
 		如果Follower没有prevLogIndex这个日志，应该返回conflictIndex = len(log)， conflictTerm = None.
 		如果Follower有prevLogIndex这个日志，但是任期不匹配，应该返回conflictTerm = log[prevLogIndex].Term，conflictIndex=往前搜索日志，找到conflictTerm的第一个日志索引
 		当Leader收到一个日志冲突的响应，Leader在日志中找到跟conflictTerm的日志，如果找到了，nextIndex=conflictTerm任期的下一个，如果没找到，则nextIndex = conflictIndex。

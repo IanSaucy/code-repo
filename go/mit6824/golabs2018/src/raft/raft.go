@@ -56,6 +56,8 @@ const NULL_PEER_ID int = -1
 const NULL_TERM = 0
 // 无效的日志索引
 const NULL_LOG_INDEX = 0
+// 第一个日志索引
+const FIRST_LOG_INDEX = 1
 
 // 超时时间
 const HEARTBEAT_TIMEOUT = 100
@@ -90,6 +92,8 @@ type Raft struct {
 
 	// 当收到客户端请求时，通知日志复制处理线程
 	logReplicationConds []*sync.Cond
+	// commitIndex更新的信号量
+	commitIndexCond *sync.Cond
 	
 	// 开始新状态之前，必须保证之前开始的旧状态的代码不起作用
 	// 所有的相关代码必须只能在逻辑时钟相同的情况起作用
@@ -165,6 +169,42 @@ func (rf *Raft)Unlock() {
 
 func (rf *Raft)getMajorityNum() int {
 	return len(rf.peers)/2 + 1
+}
+
+func (rf *Raft)getLastLogIndex() int {
+	logSize := len(rf.peers)
+
+	if logSize > 0 {
+		return rf.log[logSize - 1].Index
+	} else {
+		return FIRST_LOG_INDEX - 1
+	}
+}
+
+func (rf *Raft)logIndexToLogArrayIndex(v int) int {
+	logSize := len(rf.log)
+
+	if logSize > 0 {
+		return arrayIndex := v - rf.log[0].Index
+	} else {
+		return -1
+	}	
+}
+
+func (rf *Raft)getPrevLogTermAndIndex(v int) (int, int) {
+	logSize := len(rf.log)
+
+	if logSize > 0 {
+		arrayIndex := rf.logIndexToLogArrayIndex(v)
+
+		if arrayIndex > 0 {
+			return rf.log[arrayIndex - 1].Term, rf.log[arrayIndex - 1].Index
+		} else {
+			return NULL_TERM, NULL_LOG_INDEX	
+		}
+	} else {
+		return NULL_TERM, NULL_LOG_INDEX
+	}
 }
 
 // 比较自己的日志和对方的日志，返回1表示自己的更新；返回0表示一样新；返回-1表示自己的更旧；
@@ -478,12 +518,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// 领导人把这条命令作为新的日志条目加入到它的日志中去，
 		// 然后通知日志复制线程
 
-		logSize := len(rf.log)
-		newLogIndex := 1 // 日志索引从1开始
-		
-		if logSize > 0 {
-			newLogIndex = rf.log[logSize - 1].Index + 1
-		}
+		newLogIndex := rf.getLastLogIndex() + 1
 		
 		newLogEntry := LogEntry{
 			Term : rf.currentTerm,
@@ -525,6 +560,7 @@ func (rf *Raft) Kill() {
 	for i := 0; i < len(rf.peers); i++ {
 		rf.logReplicationConds[i].Signal()
 	}
+	rf.commitIndexCond.Broadcast()
 	
 }
 
@@ -553,6 +589,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		locker := new(sync.Mutex)
 		rf.logReplicationConds[i] = sync.NewCond(locker)
 	}
+	rf.commitIndexCond = sync.NewCond(new(sync.Mutex))
 	
 	rf.logicalClock = 0
 	rf.resetElectionTimer()
@@ -580,6 +617,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	
 	// 一个线程用于把已经提交的日志发送到applyCh
+	go handleSendApplych(applyCh)
 	
 	// 一个线程用于apply
 
@@ -587,7 +625,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft)handleElectionTimer() {
-	mydebug(rf.getStatusInfoByLock(), "开始选举超时检查线程")
+	mylog(rf.getStatusInfoByLock(), "开始选举超时检查线程")
 
 	for {
 		rf.Lock()
@@ -608,7 +646,7 @@ func (rf *Raft)handleElectionTimer() {
 		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
 	}
 	
-	mydebug(rf.getStatusInfoByLock(), "结束选举超时检查线程")
+	mylog(rf.getStatusInfoByLock(), "结束选举超时检查线程")
 }
 
 // 转换到状态，当之前的状态和新状态一样时，不做任何处理
@@ -708,14 +746,16 @@ func (rf *Raft)disconverHigherTerm(higherTerm int) {
 }
 
 func (rf *Raft)startLeader() {
+	lastLogIndex := rf.getLastLogIndex()
+	
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = rf.commitIndex + 1
+		rf.nextIndex[i] = lastLogIndex + 1
 		rf.matchIndex[i] = 0
 	}
 }
 
 func (rf *Raft)handleHeartbeat() {
-	mydebug(rf.getStatusInfoByLock(), "开始心跳检查线程")
+	mylog(rf.getStatusInfoByLock(), "开始心跳检查线程")
 	
 	for {
 		rf.Lock()
@@ -733,7 +773,7 @@ func (rf *Raft)handleHeartbeat() {
 		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
 	}
 	
-	mydebug(rf.getStatusInfoByLock(), "结束心跳检查线程")
+	mylog(rf.getStatusInfoByLock(), "结束心跳检查线程")
 }
 
 func (rf *Raft)sendHeartbeat() {
@@ -747,10 +787,12 @@ func (rf *Raft)sendHeartbeat() {
 }
 
 func (rf *Raft)handleLogReplication(server int) {
-	mydebug(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
+	mylog(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
 
 	for {
+		rf.logReplicationConds[i].L.Lock()
 		rf.logReplicationConds[i].Wait()
+		rf.logReplicationConds[i].L.Unlock()
 		
 		rf.Lock()
 		
@@ -758,15 +800,36 @@ func (rf *Raft)handleLogReplication(server int) {
 			rf.Unlock()
 			break
 		} else if rf.state == STATE_LEADER {
-			rf.sendAppenEntriesRPC(server)
+			if server != rf.me {
+				rf.sendAppenEntriesRPC(server)
+			}
 		}
 		
 		rf.Unlock()
 	}
 	
-	mydebug(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
+	mylog(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
 }
 func (rf *Raft)sendAppenEntriesRPC(server int) {
+	// If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+	//   If successful: update nextIndex and matchIndex for follower (§5.3)
+	//   If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
+
+	logSize := len(rf.log)
+	prevLogTerm, prevLogIndex := rf.getPrevLogTermAndIndex(rf.nextIndex[server])
+	entries := []LogEntry{}
+	lastLogIndex := rf.getLastLogIndex()
+
+	if lastLogIndex >= rf.nextIndex[server] {
+		start := rf.nextIndex[server]
+		end := lastLogIndex
+		entries = make([]LogEntry, end - start + 1)
+
+		for i := 0; start <= end; i++, start++ {
+			entries[i] = rf.log[start]
+		}
+	}
+	
 	args := AppendEntriesArgs{
 		Term : rf.currentTerm,
 		LeaderId : rf.me,
@@ -775,29 +838,66 @@ func (rf *Raft)sendAppenEntriesRPC(server int) {
 		Entries : entries,
 		LeaderCommit : rf.commitIndex,
 	}
-	reply := AppendEntriesReply{}
+
+	go func() {
+		reply := AppendEntriesReply{}
 			
-	mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
-	ok := rf.sendAppendEntries(server, &args, &reply)
-	mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
+		mydebug("开始向服务器", server, "发送心跳信息AppendEntries RPC")
+		ok := rf.sendAppendEntries(server, &args, &reply)
+		mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
 
-	if !ok {
-		return
+		if ok {
+			rf.Lock()
+			defer rf.Unlock()
+
+			if args.Term != rf.currentTerm {
+				// 期间任期发生了变化，忽略
+				mydebug(rf.getStatusInfo(), "发送日志期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
+			} else if reply.Success {
+				// 成功
+				rf.nextIndex[server] = rf.getLastLogIndex() + 1
+				rf.matchIndex[server] = args.prevLogIndex + len(args.Entries)
+
+				// 尝试更新Leader的commitIndex
+				rf.tryUpdateLeaderCommitIndex()
+			} else {
+				// 失败
+				rf.nextIndex[server]--
+				rf.logReplicationConds[server].Signal()
+			}
+		}
+	}()
+}
+func (rf *Raft)tryUpdateLeaderCommitIndex() {
+	// If there exists an N such that N > commitIndex, a majority
+	// of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
+
+	lastLogIndex := rf.getLastLogIndex()
+	n := rf.commitIndex + 1
+	k := rf.logIndexToLogArrayIndex(n)
+	maxN := NULL_LOG_INDEX
+
+	for n <= lastLogIndex; n++, k++ {
+		count := 0
+		
+		for i := 0; i < len(rf.peers); i++ {
+			if i != rf.me {
+				if rf.matchIndex[i] >= n && rf.log[k].Term == rf.currentTerm {
+					count++
+				}
+			} else {
+				count++
+			}
+		}
+
+		if n >= rf.getMajorityNum() {
+			maxN = n
+		}
 	}
-			
-	rf.Lock()
-	defer rf.Unlock()
 
-	if args.Term != rf.currentTerm {
-		// 期间任期发生了变化，忽略
-		mydebug(rf.getStatusInfo(), "发送日志期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
-		return
-	}
-				
-	if reply.Success {
-
-	} else {
-
+	if maxN != NULL_LOG_INDEX {
+		rf.commitIndex = maxN
+		rf.commitIndexCond.Broadcast()
 	}
 }
 
@@ -808,5 +908,32 @@ func (rf *Raft)sendHeartbeatToServer(server int) {
 	if rf.state == STATE_LEADER {
 		rf.sendAppenEntriesRPC(server)
 	}
+}
+
+func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
+	mylog(rf.getStatusInfoByLock(), "开始发送ApplyCh线程")
+
+	nextSendIndex := rf.getLastLogIndex() + 1
+	
+	for {
+		rf.commitIndexCond.L.Lock()
+		rf.commitIndexCond.Wait()
+		rf.commitIndexCond.L.Unlock()
+		
+		rf.Lock()
+		
+		if rf.state == STATE_KILLED {
+			rf.Unlock()
+			break
+		} else if rf.state == STATE_LEADER {
+			arrayIndex := rf.logIndexToArrayIndex(nextSendIndex)
+
+			
+		}
+		
+		rf.Unlock()
+	}
+	
+	mylog(rf.getStatusInfoByLock(), "结束发送ApplyCh线程")	
 }
 

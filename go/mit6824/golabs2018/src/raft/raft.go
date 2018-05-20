@@ -177,14 +177,18 @@ func (rf *Raft)getMajorityNum() int {
 	return len(rf.peers)/2 + 1
 }
 
-func (rf *Raft)getLastLogIndex() int {
+func (rf *Raft)getLastLogTermAndIndex() (int, int) {
 	logSize := len(rf.log)
 
 	if logSize > 0 {
-		return rf.log[logSize - 1].Index
+		return rf.log[logSize - 1].Term, rf.log[logSize - 1].Index
 	} else {
-		return FIRST_LOG_INDEX - 1
+		return NULL_TERM, FIRST_LOG_INDEX - 1
 	}
+}
+func (rf *Raft)getLastLogIndex() int {
+	_, i := rf.getLastLogTermAndIndex()
+	return i
 }
 
 func (rf *Raft)logIndexToLogArrayIndex(v int) int {
@@ -730,15 +734,13 @@ func (rf *Raft)handleElectionTimer() {
 
 // 转换到状态，当之前的状态和新状态一样时，不做任何处理
 func (rf *Raft) convertToState(state int) {
-	if DEBUG_RAFT {
-		mylog(rf.getStatusInfo(), "转换状态到--->", stateToString(state))
-	}
-
 	if rf.state != state {
+		mylog(rf.getStatusInfo(), "转换状态到--->", stateToString(state))
+		
 		rf.logicalClock++
 		rf.internalStartNewState(state)
 	} else {
-		mydebug(rf.getStatusInfo(), ",不用转换状态，因为状态一致：", stateToString(state))
+		mylog(rf.getStatusInfo(), ",不用转换状态，因为状态一致：", stateToString(state))
 	}
 }
 
@@ -753,12 +755,13 @@ func (rf *Raft)startNewElection() {
 	rf.logicalClock++
 	rf.votedFor = rf.me
 	rf.resetElectionTimer()
-
+	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
+	
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.votedFor,
-		LastLogIndex: 0,
-		LastLogTerm:  0,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
 	}
 	var voteCount int  = 0
 
@@ -1039,7 +1042,8 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 			rf.Unlock()
 			break
 		} else { // 不仅仅是Leader需要返回，其他的都需要返回
-			for i := 0; i < len(rf.recvCommandLogIndex); i++ {
+			i := 0
+			for ; i < len(rf.recvCommandLogIndex); i++ {
 				if rf.recvCommandLogIndex[i]<= rf.commitIndex {
 					arrayIndex := rf.logIndexToLogArrayIndex(rf.recvCommandLogIndex[i])
 					msg := ApplyMsg{
@@ -1050,10 +1054,11 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 					applyCh <- msg
 					mylog(rf.getStatusInfo(), "向ApplyCh发送", msg)
 				} else {
-					rf.recvCommandLogIndex =rf.recvCommandLogIndex[i:]
 					break
 				}
 			}
+
+			rf.recvCommandLogIndex =rf.recvCommandLogIndex[i:]
 		}
 		
 		rf.Unlock()

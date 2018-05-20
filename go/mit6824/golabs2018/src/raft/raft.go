@@ -448,7 +448,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 	} else {
 		// 任期相等
-
+		
 		// 从当前Leader收到了一个AppendEntries RPC
 		rf.resetElectionTimerForLeader()
 
@@ -460,15 +460,62 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// 说明日志不在rf.log中，在没有快照的情况下，说明这是不存在的日志
 			reply.Term = rf.currentTerm
 			reply.Success = true
+
+			rf.tryAppendEntries(0, args)
 		} else {
 			if rf.log[prevLogArrayIndex].Term == args.PrevLogTerm {
 				reply.Term = rf.currentTerm
 				reply.Success = true
+
+				rf.tryAppendEntries(prevLogArrayIndex + 1, args)
 			} else {
 				reply.Term = rf.currentTerm
 				reply.Success = false
 			}
 		}
+	}
+}
+
+func (rf *Raft)tryAppendEntries(startLogArrayIndex int, args *AppendEntriesArgs) {
+	if len(args.Entries) > 0 {
+		conflictLogArrayIndex := len(rf.log)
+
+		i := 0
+		k := startLogArrayIndex
+	
+		for ; i < len(args.Entries) && k < len(rf.log); i++ {
+			if args.Entries[i].Term != rf.log[k].Term {
+				conflictLogArrayIndex = k
+				break
+			}
+			k++
+		}
+
+		if conflictLogArrayIndex != len(rf.log) {
+			rf.log = rf.log[0 : conflictLogArrayIndex]
+		}
+
+		for ; i < len(args.Entries); i++ {
+			mylog(rf.getStatusInfo(), "收到AppendEntries RPC, 日志为：", args.Entries[i])
+			rf.log = append(rf.log, args.Entries[i])
+			rf.recvCommandLogIndex = append(rf.recvCommandLogIndex, args.Entries[i].Index)
+		}
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		lastLogIndex := rf.getLastLogIndex()
+
+		if args.LeaderCommit <= lastLogIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastLogIndex
+		}
+
+		mylog(rf.getStatusInfo(), "更新commitIndex：", rf.commitIndex)
+
+		rf.commitIndexCond.L.Lock()
+		rf.commitIndexCond.Broadcast()
+		rf.commitIndexCond.L.Unlock()
 	}
 }
 
@@ -991,7 +1038,7 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 		if rf.state == STATE_KILLED {
 			rf.Unlock()
 			break
-		} else if rf.state == STATE_LEADER {
+		} else { // 不仅仅是Leader需要返回，其他的都需要返回
 			for i := 0; i < len(rf.recvCommandLogIndex); i++ {
 				if rf.recvCommandLogIndex[i]<= rf.commitIndex {
 					arrayIndex := rf.logIndexToLogArrayIndex(rf.recvCommandLogIndex[i])

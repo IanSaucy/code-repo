@@ -69,7 +69,8 @@ const HEARTBEAT_CHECK_SLEEP = 10
 // 是否打开Raft调试
 const DEBUG_RAFT = false
 const DEBUG_RAFT_LOCK = false
-const DEBUG_RAFT_PERSIST = true
+const DEBUG_RAFT_PERSIST = false
+const DEBUG_RAFT_LEADER = false
 
 type LogEntry struct {
 	Term  int // Leader的当前任期
@@ -96,7 +97,7 @@ type Raft struct {
 	// commitIndex更新的信号量
 	commitIndexCond *sync.Cond
 
-	recvCommandLogIndex []int // 记录Leade接收的日志索引
+	lastSendApplyChIndex int // 类似lastApplied，发送给ApplyCh的日志索引，默认为0
 	
 	lastLeaderUpdateTimestamp time.Time // 最新的Leader更新时间戳
 
@@ -229,6 +230,45 @@ func (rf *Raft)getLogTermByLogIndex(v int) int {
 		}
 	} else {
 		return NULL_TERM
+	}
+}
+
+func (rf *Raft)getFirstLogIndexByTermForward(endArrayIndex int, term int) int {
+	logIndex := NULL_LOG_INDEX
+	
+	for i := endArrayIndex; i >= 0; i--{
+		if rf.log[i].Term != term {
+			break
+		} else {
+			logIndex = rf.log[i].Index
+		}
+	}
+
+	return logIndex
+}
+
+// 从nextIndex往前找
+func (rf *Raft)optimizeNextIndex(nextIndex int, conflictTerm int, conflictIndex int) int {
+	arrayIndex := rf.logIndexToLogArrayIndex(nextIndex)
+
+	if arrayIndex >= 0 {
+		i := arrayIndex
+		k := -1
+		
+		for ; i >= 0; i-- {
+			if rf.log[i].Term == conflictTerm {
+				k = i
+				break
+			}
+		}
+
+		if k >= 0 {
+			return rf.log[k + 1].Index
+		} else {
+			return conflictIndex
+		}
+	} else {
+		return NULL_LOG_INDEX
 	}
 }
 
@@ -462,6 +502,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前任期
 	Success bool // true表示Follower匹配
+	
+	ConflictIndex int // 冲突的日志索引
+	ConflictTerm int // 冲突的任期
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -505,6 +548,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if prevLogArrayIndex >= len(rf.log) { // 超了
 			reply.Term = rf.currentTerm
 			reply.Success = false
+			reply.ConflictIndex = rf.getLastLogIndex() + 1
+			reply.ConflictTerm = NULL_TERM
 		} else if prevLogArrayIndex < 0 {
 			// 说明日志不在rf.log中，在没有快照的情况下，说明这是不存在的日志
 			reply.Term = rf.currentTerm
@@ -520,6 +565,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				reply.Term = rf.currentTerm
 				reply.Success = false
+				reply.ConflictTerm = rf.log[prevLogArrayIndex].Term
+				reply.ConflictIndex = rf.getFirstLogIndexByTermForward(prevLogArrayIndex, reply.ConflictTerm)
 			}
 		}
 	}
@@ -551,7 +598,6 @@ func (rf *Raft)tryAppendEntries(startLogArrayIndex int, args *AppendEntriesArgs)
 		for ; i < len(args.Entries); i++ {
 			mylog(rf.getStatusInfo(), "收到AppendEntries RPC, 日志为：", args.Entries[i])
 			rf.log = append(rf.log, args.Entries[i])
-			rf.recvCommandLogIndex = append(rf.recvCommandLogIndex, args.Entries[i].Index)
 			logChange = true
 		}
 
@@ -571,9 +617,11 @@ func (rf *Raft)tryAppendEntries(startLogArrayIndex int, args *AppendEntriesArgs)
 
 		mylog(rf.getStatusInfo(), "更新commitIndex：", rf.commitIndex)
 
-		rf.commitIndexCond.L.Lock()
-		rf.commitIndexCond.Broadcast()
-		rf.commitIndexCond.L.Unlock()
+		go func() {
+			rf.commitIndexCond.L.Lock()
+			rf.commitIndexCond.Broadcast()
+			rf.commitIndexCond.L.Unlock()
+		}()
 	}
 }
 
@@ -654,7 +702,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 
 		mylog(rf.getStatusInfo(), "接收到新命令:", newLogEntry)
-		rf.recvCommandLogIndex = append(rf.recvCommandLogIndex, newLogIndex)
 		
 		index = newLogIndex
 		term = rf.currentTerm
@@ -689,11 +736,17 @@ func (rf *Raft) Kill() {
 	}
 	rf.state = STATE_KILLED
 
-	for i := 0; i < len(rf.peers); i++ {
-		rf.logReplicationConds[i].Signal()
-	}
-	rf.commitIndexCond.Broadcast()
-	
+	go func() {
+		for i := 0; i < len(rf.peers); i++ {
+			rf.logReplicationConds[i].L.Lock()
+			rf.logReplicationConds[i].Signal()
+			rf.logReplicationConds[i].L.Unlock()
+		}
+
+		rf.commitIndexCond.L.Lock()
+		rf.commitIndexCond.Broadcast()
+		rf.commitIndexCond.L.Unlock()
+	}()
 }
 
 //
@@ -722,6 +775,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.logReplicationConds[i] = sync.NewCond(locker)
 	}
 	rf.commitIndexCond = sync.NewCond(new(sync.Mutex))
+
+	rf.lastSendApplyChIndex = 0
 	
 	rf.resetElectionTimer()
 	rf.state = STATE_FOLLOWER
@@ -828,9 +883,6 @@ func (rf *Raft)startNewElection() {
 			if !ok {
 				return
 			}
-			if !reply.VoteGranted {
-				return
-			}
 			
 			rf.Lock()
 			defer rf.Unlock()
@@ -838,14 +890,22 @@ func (rf *Raft)startNewElection() {
 			if args.Term != rf.currentTerm {
 				// 期间任期发生了变化，忽略
 				mydebug(rf.getStatusInfo(), "发送投票期间从任期[", args.Term, "]变为任期[", rf.currentTerm, "]，忽略")
-				return
-			}
-
-			voteCount++
-			if voteCount == rf.getMajorityNum() {
-				// 收到多数派投票
-				mylog(rf.getStatusInfo(), "收到多数派投票：", voteCount, "/", len(rf.peers), "，VotedFor:", rf.votedFor, "，切换到", stateToString(STATE_LEADER))
-				rf.convertToState(STATE_LEADER)
+			} else {
+				if reply.VoteGranted {
+					voteCount++
+					if voteCount == rf.getMajorityNum() {
+						// 收到多数派投票
+						if DEBUG_RAFT_LEADER {
+							fmt.Println(rf.getStatusInfo(), "收到多数派投票：", voteCount, "/", len(rf.peers), "，VotedFor:", rf.votedFor, "，切换到", stateToString(STATE_LEADER))
+						}
+						rf.convertToState(STATE_LEADER)
+					}
+				} else {
+					if rf.currentTerm < reply.Term {
+						mylog(rf.getStatusInfo(), "AppendEntries RPC发现更高任期[", args.Term, "]，切换到Follower")
+						rf.disconverHigherTerm(args.Term)
+					}
+				}
 			}
 		}(i)
 	}
@@ -996,10 +1056,12 @@ func (rf *Raft)sendAppendEntriesRPC(server int) {
 		ok := rf.sendAppendEntries(server, &args, &reply)
 		mydebug("结束向服务器", server, "发送心跳信息AppendEntries RPC,", ok)
 
-		if ok {
-			rf.Lock()
-			defer rf.Unlock()
+		rf.Lock()
+		defer rf.Unlock()
 
+		signal := false
+
+		if ok {
 			if len(args.Entries) > 0 {
 				mylog(rf.getStatusInfo(), "收到Raft[", server, "]AppendEntriesReply:", reply)
 			}
@@ -1017,12 +1079,27 @@ func (rf *Raft)sendAppendEntriesRPC(server int) {
 			} else {
 				// 失败
 				if args.Term == reply.Term {
-					rf.nextIndex[server]--
-					rf.logReplicationConds[server].Signal()
+					signal = true
+					optimizeIndex := rf.optimizeNextIndex(rf.nextIndex[server] - 1, reply.ConflictTerm, reply.ConflictIndex)
+					//fmt.Println(rf.getStatusInfo(), "nextIndex:", rf.nextIndex[server], "optimizeIndex:", optimizeIndex, "，收到Raft[", server, "]，冲突索引:", reply.ConflictIndex, ",冲突任期", reply.ConflictTerm)
+					//rf.nextIndex[server]--
+					//rf.nextIndex[server] = reply.ConflictIndex
+					rf.nextIndex[server] = optimizeIndex
+				} else if rf.currentTerm < reply.Term {
+					mylog(rf.getStatusInfo(), "AppendEntries RPC发现更高任期[", args.Term, "]，切换到Follower")
+					rf.disconverHigherTerm(args.Term)
 				} else {
-					mylog(rf.getStatusInfo(), "收到跟参数任期[", args.Term, "]不一致的任期[", reply.Term, "]，忽略")	
+					mylog(rf.getStatusInfo(), "收到比参数任期[", args.Term, "]更旧的任期[", reply.Term, "]，忽略")	
 				}
 			}
+		}
+
+		if signal {
+			go func() {
+				rf.logReplicationConds[server].L.Lock()
+				rf.logReplicationConds[server].Signal()
+				rf.logReplicationConds[server].L.Unlock()
+			}()
 		}
 	}()
 }
@@ -1093,23 +1170,25 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 			rf.Unlock()
 			break
 		} else { // 不仅仅是Leader需要返回，其他的都需要返回
-			i := 0
-			for ; i < len(rf.recvCommandLogIndex); i++ {
-				if rf.recvCommandLogIndex[i]<= rf.commitIndex {
-					arrayIndex := rf.logIndexToLogArrayIndex(rf.recvCommandLogIndex[i])
-					msg := ApplyMsg{
-						CommandValid : true,
-						Command      : rf.log[arrayIndex].Command,
-						CommandIndex : rf.log[arrayIndex].Index,
+			i := rf.logIndexToLogArrayIndex(rf.lastSendApplyChIndex + 1)
+
+			if i >= 0 {
+				for ; i < len(rf.log); i++ {
+					if rf.log[i].Index<= rf.commitIndex {
+						msg := ApplyMsg{
+							CommandValid : true,
+							Command      : rf.log[i].Command,
+							CommandIndex : rf.log[i].Index,
+						}
+						applyCh <- msg
+						mylog(rf.getStatusInfo(), "向ApplyCh发送", msg)
+						
+						rf.lastSendApplyChIndex = rf.log[i].Index
+					} else {
+						break
 					}
-					applyCh <- msg
-					mylog(rf.getStatusInfo(), "向ApplyCh发送", msg)
-				} else {
-					break
 				}
 			}
-
-			rf.recvCommandLogIndex =rf.recvCommandLogIndex[i:]
 		}
 		
 		rf.Unlock()

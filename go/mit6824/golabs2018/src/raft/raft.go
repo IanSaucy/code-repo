@@ -140,8 +140,12 @@ func stateToString(state int) string {
 		return fmt.Sprintf("其他%d", state)
 	}
 }
+func (rf *Raft)formatStatusInfo(me int, currentTerm int, state int, logicalClock int) string {
+	now := time.Now()
+	return fmt.Sprintf("%d-%d-%d %d:%d:%d.%d Raft[%d]任期[%d]状态[%s]时钟[%d] ", now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), now.Nanosecond()/1000000, me, currentTerm, stateToString(state), logicalClock)
+}
 func (rf *Raft) getStatusInfo() string {
-	return fmt.Sprintf("Raft[%d]任期[%d]状态[%s]时钟[%d] ", rf.me, rf.currentTerm, stateToString(rf.state), rf.logicalClock)
+	return rf.formatStatusInfo(rf.me, rf.currentTerm, rf.state, rf.logicalClock)
 }
 func (rf *Raft) getStatusInfoByLock() string {
 	rf.Lock()
@@ -150,7 +154,7 @@ func (rf *Raft) getStatusInfoByLock() string {
 	logicalClock := rf.logicalClock
 	rf.Unlock()
 	
-	return fmt.Sprintf("Raft[%d]任期[%d]状态[%s]时钟[%d] ", rf.me, currentTerm, stateToString(state), logicalClock)
+	return rf.formatStatusInfo(rf.me, currentTerm, state, logicalClock)
 }
 
 func (rf *Raft)Lock() {
@@ -543,6 +547,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		rf.log = append(rf.log, newLogEntry)
 
+		mylog(rf.getStatusInfo(), "接收到新命令:", newLogEntry)
 		rf.recvCommandLogIndex = append(rf.recvCommandLogIndex, newLogIndex)
 		
 		index = newLogIndex
@@ -648,7 +653,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft)handleElectionTimer() {
-	mylog(rf.getStatusInfoByLock(), "开始选举超时检查线程")
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "开始选举超时检查线程")
+	}
 
 	for {
 		rf.Lock()
@@ -668,8 +675,10 @@ func (rf *Raft)handleElectionTimer() {
 		
 		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
 	}
-	
-	mylog(rf.getStatusInfoByLock(), "结束选举超时检查线程")
+
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "结束选举超时检查线程")
+	}
 }
 
 // 转换到状态，当之前的状态和新状态一样时，不做任何处理
@@ -778,7 +787,9 @@ func (rf *Raft)startLeader() {
 }
 
 func (rf *Raft)handleHeartbeat() {
-	mylog(rf.getStatusInfoByLock(), "开始心跳检查线程")
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "开始心跳检查线程")
+	}
 	
 	for {
 		rf.Lock()
@@ -795,8 +806,10 @@ func (rf *Raft)handleHeartbeat() {
 		
 		time.Sleep(time.Duration(ELECTION_TIMER_CHECK_SLEEP) * time.Millisecond)
 	}
-	
-	mylog(rf.getStatusInfoByLock(), "结束心跳检查线程")
+
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "结束心跳检查线程")
+	}
 }
 
 func (rf *Raft)sendHeartbeat() {
@@ -810,7 +823,9 @@ func (rf *Raft)sendHeartbeat() {
 }
 
 func (rf *Raft)handleLogReplication(server int) {
-	mylog(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
+	}
 
 	rf.logReplicationConds[server].L.Lock()
 
@@ -832,8 +847,10 @@ func (rf *Raft)handleLogReplication(server int) {
 	}
 		
 	rf.logReplicationConds[server].L.Unlock()
-	
-	mylog(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
+
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
+	}
 }
 func (rf *Raft)sendAppendEntriesRPC(server int) {
 	// If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
@@ -845,15 +862,20 @@ func (rf *Raft)sendAppendEntriesRPC(server int) {
 	entries := []LogEntry{}
 	lastLogIndex := rf.getLastLogIndex()
 
-	mylog(rf.getStatusInfo(), "Server:", server, ",lastLogIndex:", lastLogIndex, ",nextIndex:", rf.nextIndex[server])
+	mydebug(rf.getStatusInfo(), "Server:", server, ",lastLogIndex:", lastLogIndex, ",nextIndex:", rf.nextIndex[server])
 	if lastLogIndex >= rf.nextIndex[server] {
-		start := rf.nextIndex[server]
-		end := lastLogIndex
-		entries = make([]LogEntry, end - start + 1)
-
-		for i := 0; start <= end; i++ {
-			entries[i] = rf.log[start]
-			start++
+		startLogIndex := rf.nextIndex[server]
+		endLogIndex := lastLogIndex
+		startArrayIndex := rf.logIndexToLogArrayIndex(startLogIndex)
+		endArrayIndex := rf.logIndexToLogArrayIndex(endLogIndex)
+		
+		entries = make([]LogEntry, endLogIndex - startLogIndex + 1)
+		
+		mylog(rf.getStatusInfo(), "需要发送Raft[", server, "]的日志索引从", startLogIndex, "到", endLogIndex, "，在log[]中的位置从", startArrayIndex, "到", endArrayIndex, ",log[]长度：", len(rf.log))
+		
+		for i := 0; startArrayIndex <= endArrayIndex; i++ {
+			entries[i] = rf.log[startArrayIndex]
+			startArrayIndex++
 		}
 	}
 	
@@ -877,7 +899,9 @@ func (rf *Raft)sendAppendEntriesRPC(server int) {
 			rf.Lock()
 			defer rf.Unlock()
 
-			mylog(rf.getStatusInfo(), "收到AppendEntriesReply:", reply)
+			if len(args.Entries) > 0 {
+				mylog(rf.getStatusInfo(), "收到Raft[", server, "]AppendEntriesReply:", reply)
+			}
 			
 			if args.Term != rf.currentTerm {
 				// 期间任期发生了变化，忽略
@@ -923,7 +947,7 @@ func (rf *Raft)tryUpdateLeaderCommitIndex() {
 			}
 		}
 
-		if n >= rf.getMajorityNum() {
+		if count >= rf.getMajorityNum() {
 			maxN = n
 		}
 
@@ -931,6 +955,7 @@ func (rf *Raft)tryUpdateLeaderCommitIndex() {
 	}
 
 	if maxN != NULL_LOG_INDEX {
+		mylog(rf.getStatusInfo(), "更新commitIndex：", maxN)
 		rf.commitIndex = maxN
 
 		go func() {
@@ -951,7 +976,9 @@ func (rf *Raft)sendHeartbeatToServer(server int) {
 }
 
 func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
-	mylog(rf.getStatusInfoByLock(), "开始发送ApplyCh线程")
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "开始发送ApplyCh线程")
+	}
 
 	rf.commitIndexCond.L.Lock()
 
@@ -968,11 +995,13 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 			for i := 0; i < len(rf.recvCommandLogIndex); i++ {
 				if rf.recvCommandLogIndex[i]<= rf.commitIndex {
 					arrayIndex := rf.logIndexToLogArrayIndex(rf.recvCommandLogIndex[i])
-					applyCh <- ApplyMsg{
+					msg := ApplyMsg{
 						CommandValid : true,
 						Command      : rf.log[arrayIndex].Command,
 						CommandIndex : rf.log[arrayIndex].Index,
 					}
+					applyCh <- msg
+					mylog(rf.getStatusInfo(), "向ApplyCh发送", msg)
 				} else {
 					rf.recvCommandLogIndex =rf.recvCommandLogIndex[i:]
 					break
@@ -984,12 +1013,16 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 	}
 	
 	rf.commitIndexCond.L.Unlock()
-	
-	mylog(rf.getStatusInfoByLock(), "结束发送ApplyCh线程")	
+
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "结束发送ApplyCh线程")
+	}
 }
 
 func (rf *Raft)handleLogApply() {
-	mylog(rf.getStatusInfoByLock(), "开始日志Apply线程")
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "开始日志Apply线程")
+	}
 	
 	rf.commitIndexCond.L.Lock()
 
@@ -1017,6 +1050,8 @@ func (rf *Raft)handleLogApply() {
 	}
 	
 	rf.commitIndexCond.L.Unlock()
-	
-	mylog(rf.getStatusInfoByLock(), "结束日志Apply线程")	
+
+	if DEBUG_RAFT {
+		mylog(rf.getStatusInfoByLock(), "结束日志Apply线程")
+	}
 }

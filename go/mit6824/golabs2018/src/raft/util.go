@@ -14,7 +14,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const mydebugEnabled = false
-const mylogEnabled = true
+const mylogEnabled = false
 
 func mydebug(a ...interface{}) (n int, err error) {
 	if mydebugEnabled {

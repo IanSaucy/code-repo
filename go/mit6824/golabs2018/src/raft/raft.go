@@ -22,9 +22,9 @@ import "labrpc"
 import "time"
 import "math/rand"
 import "fmt"
-
-// import "bytes"
-// import "labgob"
+import "bytes"
+import "labgob"
+import "strconv"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -69,6 +69,7 @@ const HEARTBEAT_CHECK_SLEEP = 10
 // 是否打开Raft调试
 const DEBUG_RAFT = false
 const DEBUG_RAFT_LOCK = false
+const DEBUG_RAFT_PERSIST = true
 
 type LogEntry struct {
 	Term  int // Leader的当前任期
@@ -96,11 +97,6 @@ type Raft struct {
 	commitIndexCond *sync.Cond
 
 	recvCommandLogIndex []int // 记录Leade接收的日志索引
-	
-	// 开始新状态之前，必须保证之前开始的旧状态的代码不起作用
-	// 所有的相关代码必须只能在逻辑时钟相同的情况起作用
-	// 当任期发生变化，或者状态发生变化，逻辑时钟递增
-	logicalClock int
 	
 	lastLeaderUpdateTimestamp time.Time // 最新的Leader更新时间戳
 
@@ -140,21 +136,40 @@ func stateToString(state int) string {
 		return fmt.Sprintf("其他%d", state)
 	}
 }
-func (rf *Raft)formatStatusInfo(me int, currentTerm int, state int, logicalClock int) string {
+func (rf *Raft)formatLogInfo() string {
+	logStr := ""
+	logStr += "["
+	
+	for i := 0; i < len(rf.log); i++ {
+		if i != 0 {
+			logStr += "," + strconv.Itoa(rf.log[i].Term)
+		} else {
+			logStr += "" + strconv.Itoa(rf.log[i].Term)
+		}
+	}
+	logStr += "]"
+
+	return logStr
+}
+
+func (rf *Raft)formatStatusInfo(me int, currentTerm int, state int) string {
 	now := time.Now()
-	return fmt.Sprintf("%d-%d-%d %d:%d:%d.%d Raft[%d]任期[%d]状态[%s]时钟[%d] ", now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), now.Nanosecond()/1000000, me, currentTerm, stateToString(state), logicalClock)
+	
+	return fmt.Sprintf("%d-%d-%d %d:%d:%d.%d Raft[%d]任期[%d]状态[%s] ",
+		now.Year(), now.Month(), now.Day(),
+		now.Hour(), now.Minute(), now.Second(), now.Nanosecond()/1000000,
+		me, currentTerm, stateToString(state))
 }
 func (rf *Raft) getStatusInfo() string {
-	return rf.formatStatusInfo(rf.me, rf.currentTerm, rf.state, rf.logicalClock)
+	return rf.formatStatusInfo(rf.me, rf.currentTerm, rf.state)
 }
 func (rf *Raft) getStatusInfoByLock() string {
 	rf.Lock()
+	defer rf.Unlock()
+	
 	currentTerm := rf.currentTerm
 	state := rf.state
-	logicalClock := rf.logicalClock
-	rf.Unlock()
-	
-	return rf.formatStatusInfo(rf.me, currentTerm, state, logicalClock)
+	return rf.formatStatusInfo(rf.me, currentTerm, state)
 }
 
 func (rf *Raft)Lock() {
@@ -242,6 +257,7 @@ func (rf *Raft)checkLogUpToDate(logTerm int, logIndex int) int {
 func (rf *Raft) voteForCandidate(args *RequestVoteArgs) bool {
 	if (rf.votedFor == NULL_PEER_ID || rf.votedFor == args.CandidateId) && (rf.checkLogUpToDate(args.LastLogTerm, args.LastLogIndex) <= 0) {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		// 给其他候选人投票了，重置选举超时
 		mylog(rf.getStatusInfo(), "给Raft[", args.CandidateId, "]投票，因此重置选举超时")
 		rf.resetElectionTimerForVote()
@@ -321,6 +337,20 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
+	if DEBUG_RAFT_PERSIST {
+		fmt.Println(rf.getStatusInfo(), "日志:", rf.formatLogInfo())
+	}
 }
 
 //
@@ -343,6 +373,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		// 读取出错
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -374,7 +419,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if DEBUG_RAFT {
 		rf.Lock()
-		mylog(rf.getStatusInfo(), "收到RequestVote RPC")
+		mydebug(rf.getStatusInfo(), "收到RequestVote RPC")
 		rf.Unlock()
 	}
 
@@ -495,14 +540,23 @@ func (rf *Raft)tryAppendEntries(startLogArrayIndex int, args *AppendEntriesArgs)
 			k++
 		}
 
+
+		logChange := false
+		
 		if conflictLogArrayIndex != len(rf.log) {
 			rf.log = rf.log[0 : conflictLogArrayIndex]
+			logChange = true
 		}
 
 		for ; i < len(args.Entries); i++ {
 			mylog(rf.getStatusInfo(), "收到AppendEntries RPC, 日志为：", args.Entries[i])
 			rf.log = append(rf.log, args.Entries[i])
 			rf.recvCommandLogIndex = append(rf.recvCommandLogIndex, args.Entries[i].Index)
+			logChange = true
+		}
+
+		if logChange {
+			rf.persist()
 		}
 	}
 
@@ -597,6 +651,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command : command,
 		}
 		rf.log = append(rf.log, newLogEntry)
+		rf.persist()
 
 		mylog(rf.getStatusInfo(), "接收到新命令:", newLogEntry)
 		rf.recvCommandLogIndex = append(rf.recvCommandLogIndex, newLogIndex)
@@ -633,7 +688,6 @@ func (rf *Raft) Kill() {
 		mylog(rf.getStatusInfo(), "Kill")
 	}
 	rf.state = STATE_KILLED
-	rf.logicalClock++
 
 	for i := 0; i < len(rf.peers); i++ {
 		rf.logReplicationConds[i].Signal()
@@ -669,7 +723,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.commitIndexCond = sync.NewCond(new(sync.Mutex))
 	
-	rf.logicalClock = 0
 	rf.resetElectionTimer()
 	rf.state = STATE_FOLLOWER
 	rf.currentTerm = 0
@@ -705,7 +758,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft)handleElectionTimer() {
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "开始选举超时检查线程")
+		mydebug(rf.getStatusInfoByLock(), "开始选举超时检查线程")
 	}
 
 	for {
@@ -728,7 +781,7 @@ func (rf *Raft)handleElectionTimer() {
 	}
 
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "结束选举超时检查线程")
+		mydebug(rf.getStatusInfoByLock(), "结束选举超时检查线程")
 	}
 }
 
@@ -736,8 +789,6 @@ func (rf *Raft)handleElectionTimer() {
 func (rf *Raft) convertToState(state int) {
 	if rf.state != state {
 		mylog(rf.getStatusInfo(), "转换状态到--->", stateToString(state))
-		
-		rf.logicalClock++
 		rf.internalStartNewState(state)
 	} else {
 		mylog(rf.getStatusInfo(), ",不用转换状态，因为状态一致：", stateToString(state))
@@ -752,8 +803,8 @@ func (rf *Raft)startNewElection() {
 	// • Send RequestVote RPCs to all other servers
 
 	rf.currentTerm++
-	rf.logicalClock++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.resetElectionTimer()
 	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
 	
@@ -817,7 +868,7 @@ func (rf *Raft) internalStartNewState(state int) {
 func (rf *Raft)disconverHigherTerm(higherTerm int) {
 	rf.currentTerm = higherTerm
 	rf.votedFor = NULL_PEER_ID
-	rf.logicalClock++
+	rf.persist()
 
 	if rf.state != STATE_FOLLOWER {
 		mylog(rf.getStatusInfo(), "转换状态到--->", stateToString(STATE_FOLLOWER))
@@ -838,7 +889,7 @@ func (rf *Raft)startLeader() {
 
 func (rf *Raft)handleHeartbeat() {
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "开始心跳检查线程")
+		mydebug(rf.getStatusInfoByLock(), "开始心跳检查线程")
 	}
 	
 	for {
@@ -858,7 +909,7 @@ func (rf *Raft)handleHeartbeat() {
 	}
 
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "结束心跳检查线程")
+		mydebug(rf.getStatusInfoByLock(), "结束心跳检查线程")
 	}
 }
 
@@ -874,7 +925,7 @@ func (rf *Raft)sendHeartbeat() {
 
 func (rf *Raft)handleLogReplication(server int) {
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
+		mydebug(rf.getStatusInfoByLock(), "开始日志复制线程,Server:", server)
 	}
 
 	rf.logReplicationConds[server].L.Lock()
@@ -899,7 +950,7 @@ func (rf *Raft)handleLogReplication(server int) {
 	rf.logReplicationConds[server].L.Unlock()
 
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
+		mydebug(rf.getStatusInfoByLock(), "结束日志复制线程,Server:", server)
 	}
 }
 func (rf *Raft)sendAppendEntriesRPC(server int) {
@@ -1027,7 +1078,7 @@ func (rf *Raft)sendHeartbeatToServer(server int) {
 
 func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "开始发送ApplyCh线程")
+		mydebug(rf.getStatusInfoByLock(), "开始发送ApplyCh线程")
 	}
 
 	rf.commitIndexCond.L.Lock()
@@ -1067,13 +1118,13 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 	rf.commitIndexCond.L.Unlock()
 
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "结束发送ApplyCh线程")
+		mydebug(rf.getStatusInfoByLock(), "结束发送ApplyCh线程")
 	}
 }
 
 func (rf *Raft)handleLogApply() {
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "开始日志Apply线程")
+		mydebug(rf.getStatusInfoByLock(), "开始日志Apply线程")
 	}
 	
 	rf.commitIndexCond.L.Lock()
@@ -1088,12 +1139,16 @@ func (rf *Raft)handleLogApply() {
 			rf.Unlock()
 			break
 		} else {
-			for i := rf.logIndexToLogArrayIndex(rf.lastApplied + 1); i < len(rf.log); i++ {
-				if rf.log[i].Index<= rf.commitIndex {
-					mylog(rf.getStatusInfo(), "把任期[", rf.log[i].Term, "]索引[", rf.log[i].Index, "]的日志应用到状态机中")
-					rf.lastApplied = rf.log[i].Index
-				} else {
-					break
+			i := rf.logIndexToLogArrayIndex(rf.lastApplied + 1)
+
+			if i >= 0 {
+				for ; i < len(rf.log); i++ {
+					if rf.log[i].Index<= rf.commitIndex {
+						mylog(rf.getStatusInfo(), "把任期[", rf.log[i].Term, "]索引[", rf.log[i].Index, "]的日志应用到状态机中")
+						rf.lastApplied = rf.log[i].Index
+					} else {
+						break
+					}
 				}
 			}
 		}
@@ -1104,6 +1159,6 @@ func (rf *Raft)handleLogApply() {
 	rf.commitIndexCond.L.Unlock()
 
 	if DEBUG_RAFT {
-		mylog(rf.getStatusInfoByLock(), "结束日志Apply线程")
+		mydebug(rf.getStatusInfoByLock(), "结束日志Apply线程")
 	}
 }

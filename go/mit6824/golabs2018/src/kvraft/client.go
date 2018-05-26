@@ -3,11 +3,21 @@ package raftkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
+import "time"
+import "sync/atomic"
 
+var seqNo int64 = 1 // 唯一编号
+
+func nextval(addr *int64) int64 {
+	return atomic.AddInt64(addr, 1)
+}
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	clientId int64 // 客户端id
+	leader int // 上一次发送RPC的leader，默认初始化为随机数
 }
 
 func nrand() int64 {
@@ -21,6 +31,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+
+	ck.clientId = nextval(&seqNo)
+	ck.leader = int(nrand()) % len(ck.servers)
+	
 	return ck
 }
 
@@ -39,6 +53,35 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+
+	args := GetArgs{
+		Key : key,
+		ClientId : ck.clientId,
+		OpNo : nextval(&seqNo),
+	}
+	serverLen := len(ck.servers)
+
+	for {
+		var reply GetReply
+		
+		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
+
+		if ok {
+			if reply.WrongLeader {
+				// 不是leader
+				ck.leader = (ck.leader + 1) % serverLen
+			} else {
+				if reply.Err != nil {
+					fmt.Println("Get[", args.OpNo, "]发生错误,", reply.Err)
+				} else {
+					return reply.Value
+				}
+			}
+		} else {
+			// RPC未正常返回
+		}
+	}
+	
 	return ""
 }
 
@@ -54,6 +97,36 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+
+	args := PutAppendArgs{
+		Key : key,
+		Value : value,
+		Op : op,
+		ClientId : ck.clientId,
+		OpNo : nextval(&seqNo),
+	}
+	serverLen := len(ck.servers)
+
+	for {
+		var reply PutAppendReply
+		
+		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
+
+		if ok {
+			if reply.WrongLeader {
+				// 不是leader
+				ck.leader = (ck.leader + 1) % serverLen
+			} else {
+				if reply.Err != nil {
+					fmt.Println(op, "[", args.OpNo, "]发生错误,", reply.Err)
+				} else {
+					break;
+				}
+			}
+		} else {
+			// RPC未正常返回
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

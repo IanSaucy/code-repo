@@ -71,11 +71,15 @@ func (ck *Clerk) Get(key string) string {
 				// 不是leader
 				ck.leader = (ck.leader + 1) % serverLen
 			} else {
-				if reply.Err != nil {
-					fmt.Println("Get[", args.OpNo, "]发生错误,", reply.Err)
-				} else {
-					return reply.Value
-				}
+				// 是leader
+			}
+			
+			if reply.Err == OK {
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				return ""
+			} else {
+				mylog("Get[", args.OpNo, "]发生错误,", reply.Err)
 			}
 		} else {
 			// RPC未正常返回
@@ -117,11 +121,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				// 不是leader
 				ck.leader = (ck.leader + 1) % serverLen
 			} else {
-				if reply.Err != nil {
-					fmt.Println(op, "[", args.OpNo, "]发生错误,", reply.Err)
-				} else {
-					break;
-				}
+				// 是leader
+			}
+			
+			if reply.Err == OK {
+				return reply.Value
+			} else {
+				mylog(op, "[", args.OpNo, "]发生错误,", reply.Err)
 			}
 		} else {
 			// RPC未正常返回

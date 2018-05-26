@@ -3,6 +3,7 @@ package raftkv
 const (
 	OK       = "OK"
 	ErrNoKey = "ErrNoKey"
+	NotSameCommand = "命令被冲掉"
 )
 
 type Err string

@@ -3,8 +3,11 @@ package raftkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
-import "time"
 import "sync/atomic"
+import "time"
+import "raft"
+
+const DEBUG_CLIENT = true
 
 var seqNo int64 = 1 // 唯一编号
 
@@ -17,7 +20,7 @@ type Clerk struct {
 	// You will have to modify this struct.
 
 	clientId int64 // 客户端id
-	leader int // 上一次发送RPC的leader，默认初始化为随机数
+	leader   int   // 上一次发送RPC的leader，默认初始化为随机数
 }
 
 func nrand() int64 {
@@ -34,8 +37,74 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 	ck.clientId = nextval(&seqNo)
 	ck.leader = int(nrand()) % len(ck.servers)
-	
+
 	return ck
+}
+
+// 返回true表示成功结束, 否则继续循环
+func (ck *Clerk) tryOp(op string, args interface{}) interface{} {
+	startLeader := ck.leader
+
+	mylog("开始发送请求", OpStructToString(args))
+
+	for {
+		var reply interface{}
+
+		if op == KVServerGet {
+			reply = &GetReply{}
+		} else {
+			reply = &PutAppendReply{}
+		}
+
+		ch := make(chan bool)
+
+		go func(leader int) {
+			if DEBUG_CLIENT {
+				mylog("向KVServer[", leader, "]开始发送请求", OpStructToString(args))
+			}
+			ok := ck.servers[leader].Call(op, args, reply)
+			if DEBUG_CLIENT {
+				mylog("向KVServer[", leader, "]结束发送请求", OpStructToString(reply))
+			}
+			ch <- ok
+		}(ck.leader)
+
+		select {
+		case <-time.After(time.Duration(KVServerRPCTimeout) * time.Millisecond):
+			// 超时了，继续
+		case ok := <-ch:
+			// 收到RPC返回
+			var err Err
+
+			if op == KVServerGet {
+				tmpArgs := reply.(*GetReply)
+				err = tmpArgs.Err
+			} else {
+				tmpArgs := reply.(*PutAppendReply)
+				err = tmpArgs.Err
+			}
+
+			if ok {
+				if err == OK || err == ErrNoKey || err == KVServerKilled {
+					mylog("结束发送请求", OpStructToString(args))
+					return reply
+				} else if err == WrongLeader {
+					// 不是leader，继续
+				}  else {
+					mylog(OpStructToString(args), "发生未知错误[", err, "]")
+				}
+
+			} else {
+				// RPC未正常返回
+				mylog("RPC Call未正常返回")
+			}
+		}
+
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+		if ck.leader == startLeader { // 走了一圈
+			time.Sleep(time.Duration(raft.MAX_ELECTION_TIMEOUT) * time.Millisecond)
+		}
+	}
 }
 
 //
@@ -55,38 +124,13 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 
 	args := GetArgs{
-		Key : key,
-		ClientId : ck.clientId,
-		OpNo : nextval(&seqNo),
+		Key:      key,
+		ClientId: ck.clientId,
+		OpNo:     nextval(&seqNo),
 	}
-	serverLen := len(ck.servers)
 
-	for {
-		var reply GetReply
-		
-		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
-
-		if ok {
-			if reply.WrongLeader {
-				// 不是leader
-				ck.leader = (ck.leader + 1) % serverLen
-			} else {
-				// 是leader
-			}
-			
-			if reply.Err == OK {
-				return reply.Value
-			} else if reply.Err == ErrNoKey {
-				return ""
-			} else {
-				mylog("Get[", args.OpNo, "]发生错误,", reply.Err)
-			}
-		} else {
-			// RPC未正常返回
-		}
-	}
-	
-	return ""
+	reply := ck.tryOp(KVServerGet, &args)
+	return reply.(*GetReply).Value
 }
 
 //
@@ -103,36 +147,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 
 	args := PutAppendArgs{
-		Key : key,
-		Value : value,
-		Op : op,
-		ClientId : ck.clientId,
-		OpNo : nextval(&seqNo),
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		OpNo:     nextval(&seqNo),
 	}
-	serverLen := len(ck.servers)
 
-	for {
-		var reply PutAppendReply
-		
-		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
-
-		if ok {
-			if reply.WrongLeader {
-				// 不是leader
-				ck.leader = (ck.leader + 1) % serverLen
-			} else {
-				// 是leader
-			}
-			
-			if reply.Err == OK {
-				return reply.Value
-			} else {
-				mylog(op, "[", args.OpNo, "]发生错误,", reply.Err)
-			}
-		} else {
-			// RPC未正常返回
-		}
-	}
+	ck.tryOp(KVServerPutAppend, &args)
 }
 
 func (ck *Clerk) Put(key string, value string) {

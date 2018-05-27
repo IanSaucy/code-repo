@@ -1,0 +1,9 @@
+lab参考实现
+	https://github.com/xingdl2007/6.824-2017
+	https://github.com/wqlin/mit-6.824-2018
+
+lab3
+	KVServer的锁，不要包括Raft调用
+
+	客户端命令重复检查，放在Apply这一步，命令选择都发起Raft
+	

@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"fmt"
 	"labgob"
 	"labrpc"
 	"log"
@@ -18,7 +19,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const mydebugEnabled = false
-const mylogEnabled = true
+const mylogEnabled = false
+const DEBUG_KVSERVER = false
+const DEBUG_GET = true && DEBUG_KVSERVER
+const DEBUG_PUTAPPEND = true && DEBUG_KVSERVER
+const DEBUG_APPLYMSG = false && DEBUG_KVSERVER
 
 func mydebug(a ...interface{}) (n int, err error) {
 	if mydebugEnabled {
@@ -45,24 +50,29 @@ type Op struct {
 	Value    string
 }
 
-const OP_STATE_STARTED = 1 // 已经调用了raft的Start，但是没有收到响应
-const OP_STATE_APPLIED = 2 // 收到了raft的apply消息
+const OP_STATE_STARTED = 1  // 已经调用了raft的Start，但是没有收到响应
+const OP_STATE_APPLIED = 2  // 收到了raft的apply消息
+const OP_STATE_REPLACED = 3 // 提交的命令的日志索引被其他命令占去了
 
-type OpResult struct {
-	ClientId int64
-	OpNo    int64 // 唯一操作编号
-	OpState int   // 操作状态
-
+type OpReply struct {
 	Term int
-	CommandIndex int
 
-	NofityCh chan int // 通知其他等待的
-	WaitCount int // 等待的个数计数
-
-	// 上一次已经完成时的返回数据，包括PutAppendReply和GetReply的并集
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+type OpResult struct {
+	ClientId int64
+	OpNo     int64 // 唯一操作编号
+
+	Term         int
+	CommandIndex int
+
+	NotifyCh  chan OpReply // 通知其他等待的
+	WaitCount int          // 等待的个数计数
+
+	reply OpReply
 }
 
 type KVServer struct {
@@ -94,90 +104,75 @@ func (kv *KVServer) Unlock() {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	
-	if kv.tryGet(args, reply) {
-			kv.Lock()
-			opResult := kv.lastClientOpMap[args.ClientId]
-			kv.Unlock()
 
-			select {
-			case <- kv.killCh:
-				// 结束
-				reply.WrongLeader = false
-				reply.Err = Err("KVServer Killed")
-				reply.Value = nil
-			case <- opResult.NofityCh:
-				// 收到通知
-				kv.Lock()
-				reply.WrongLeader = opResult.WrongLeader
-				reply.Err = opResult.Err
-				reply.Value = opResult.Value
-				kv.Unlock()
-			}
-		}
+	if DEBUG_GET {
+		mylog("KVServer[", kv.me, "]接收到", OpStructToString(args))
+	}
+
+	opReply := kv.tryOp("Get", args.ClientId, args.OpNo, args.Key, "")
+	reply.WrongLeader = opReply.WrongLeader
+	reply.Err = opReply.Err
+	reply.Value = opReply.Value
+
+	if DEBUG_GET {
+		mylog("KVServer[", kv.me, "]接收到", OpStructToString(args), "返回", OpStructToString(reply))
+	}
 }
 
-// 返回true说明需要等待，false说明不需要等待
-func (kv *KVServer) tryGet(args *GetArgs, reply *GetReply) bool {
-	kv.Lock()
-	defer kv.Unlock()
-
-	term, isLeader := kv.rf.GetState()
+func (kv *KVServer) tryOp(op string, clientId int64, opNo int64, key string, value string) OpReply {
+	cmd := Op{
+		Op:       op,
+		ClientId: clientId,
+		OpNo:     opNo,
+		Key:      key,
+		Value:    value,
+	}
+	index, term, isLeader := kv.rf.Start(cmd)
+	mylog("KVServer[", kv.me, "]发起命令Client[", clientId, "]Op[", opNo, "]", op, ",", key, ",", value, ",任期[", term, "]日志索引[", index, "]")
 
 	if !isLeader {
-		reply.WrongLeader = true
-		reply.Err = nil
-		reply.Value = nil
+		return OpReply{WrongLeader: true, Err: WrongLeader}
 	} else {
-	opResult, ok := kv.lastClientOpMap[args.ClientId]
-
-	if ok && opResult.OpNo == args.OpNo {
-		if opResult.OpState == STATE_ARRLIED {
-			mylog("发现重复Get[", args.OpNo, "]请求，之前已经应用，直接返回")
-			reply.WrongLeader = opResult.WrongLeader
-			reply.Err = opResult.Err
-			reply.Value = opResult.Value
-			return false
-		} else {
-			mylog("发现重复Get[", args.OpNo, "]请求，之前还没有应用，需要等待")
-			opResult.WaitCount++
-			return true
+		opRes := &OpResult{
+			ClientId:     clientId,
+			OpNo:         opNo,
+			Term:         term,
+			CommandIndex: index,
+			NotifyCh:     make(chan OpReply),
 		}
-	} else {
-		op := Op{
-			Op:       "Get",
-			ClientId: args.ClientId,
-			OpNo:     args.OpNo,
-			Key:      args.Key,
-			Value:    nil,
-		}
-		index, term, isLeader := kv.rf.Start(op)
+		kv.Lock()
+		kv.lastCommandMap[index] = opRes
+		kv.Unlock()
 
-		if !isLeader {
-			reply.WrongLeader = true
-			reply.Err = nil
-			reply.Value = nil
-			return false
-		} else {
-			opRes = &OpResult{
-				ClientId : args.ClientId,
-				OpNo:     args.OpNo,
-				OpState:  OP_STATE_STARTED,
-				Term : term,
-				CommandIndex : index,
-				NofityCh: make(chan int),
-				WaitCount : 1,
+		select {
+		case <-kv.killCh:
+			// 结束
+			return OpReply{WrongLeader: true, Err: KVServerKilled}
+		case opReply := <-opRes.NotifyCh:
+			// 收到通知
+			if opReply.Term != term {
+				return OpReply{WrongLeader: true, Err: WrongLeader}
+			} else {
+				return opReply
 			}
-			kv.lastClientOpMap[args.ClientId] = opRes
-			kv.lastCommandMap[index] = opRes
-			return true
 		}
-	}	
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
+	if DEBUG_PUTAPPEND {
+		mylog("KVServer[", kv.me, "]接收到", OpStructToString(args))
+	}
+
+	opReply := kv.tryOp(args.Op, args.ClientId, args.OpNo, args.Key, args.Value)
+	reply.WrongLeader = opReply.WrongLeader
+	reply.Err = opReply.Err
+
+	if DEBUG_PUTAPPEND {
+		mylog("KVServer[", kv.me, "]接收到", OpStructToString(args), "返回", OpStructToString(reply))
+	}
 }
 
 //
@@ -190,9 +185,9 @@ func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 
-	go func() {
-		kv.killCh <- 0
-	}()
+	mylog("KVServer[", kv.me, "]Killed")
+
+	close(kv.killCh)
 }
 
 //
@@ -226,96 +221,131 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.killCh = make(chan int, 1)
-	kv.kvMap map[string]string = make(map[string]string)
+	kv.kvMap = make(map[string]string)
 	kv.lastClientOpMap = make(map[int64]*OpResult)
 	kv.lastCommandMap = make(map[int]*OpResult)
 
-	go kv.applyCommand()
+	go kv.applyCommandThread()
 
 	return kv
 }
 
-func (kv *KVServer)applyCommand() {
+func (kv *KVServer) applyCommandThread() {
 	running := true
+
+	mylog("KVServer[", kv.me, "]开始applyCommandThread")
 
 	for running {
 		select {
-		case <- kv.killCh:
+		case <-kv.killCh:
 			// 关闭了
 			running = false
-		case msg := <- kv.applyCh:
+		case msg := <-kv.applyCh:
 			// 收到ApplyMsg
-			//CommandIndex int
-			kv.Lock()
-
-			term, isLeader := kv.rf.GetState()
-			
-			if msg.CommandValid {
-				cmd := Op(msg.Command)
-				var value string = nil
-				var err Err = nil
-
-				switch cmd.Op {
-				case "Get":
-					if oldValue, ok := kv.kvMap[cmd.Key]; ok {
-						// 存在
-						value = oldValue
-						err = OK
-					} else {
-						// 不存在
-						err = ErrNoKey
-					}
-				case "Put":
-					kv.kvMap[cmd.Key] = cmd.Value
-					err = OK
-				case "Append":
-					if oldValue, ok := kv.kvMap[cmd.Key]; ok {
-						kv.kvMap[cmd.Key] = oldValue + cmd.Value
-					} else {
-						kv.kvMap[cmd.Key] = cmd.Value	
-					}
-					err = OK
-				}
-
-				if opResult, ok := kv.lastCommandMap[msg.CommandIndex]; ok {
-					if opResult.ClientId != cmd.ClientId || opResult.OpNo != cmd.OpNo {
-						// 不是同一个命令
-						opResult.Err = NotSameCommand
-					} else {
-						// 同一个命令
-						opResult.Err = err
-					}
-					opResult.WrongLeader = !isLeader
-					opResult.Value = value
-					opResult.OpState = OP_STATE_APPLIED
-
-					for i := 0; i < opResult.WaitCount; i++ {
-						go func() {
-							kv.Lock()
-							opResult.NotifyCh <- 0
-							kv.Unlock()
-						}()
-					}
-				}
-
-				opRes = &OpResult{
-					ClientId : cmd.ClientId,
-					OpNo:     cmd.OpNo,
-					OpState:  OP_STATE_ARRLIED,
-					Term : term,
-					CommandIndex : index,
-					NofityCh: make(chan int),
-					WaitCount : 0,
-					WrongLeader : !isLeader,
-					Err : err,
-					Value : value,
-				}
-				kv.lastClientOpMap[args.ClientId] = opRes
-			} else {
-				// 其他
-			}
-			
-			kv.Unlock()
+			kv.applyCommand(msg)
 		}
 	}
+
+	mylog("KVServer[", kv.me, "]结束applyCommandThread")
+}
+func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
+	if DEBUG_APPLYMSG {
+		mylog("KVServer[", kv.me, "]接收到ApplyMsg", msg)
+	}
+
+	if msg.CommandValid {
+		kv.applyValidCommand(msg)
+	} else {
+		// 其他
+	}
+}
+func (kv *KVServer) isSameWithPrevious(op Op) bool {
+	if opResult, ok := kv.lastClientOpMap[op.ClientId]; ok {
+		return opResult.OpNo == op.OpNo
+	} else {
+		return false
+	}
+}
+func (kv *KVServer) applyValidCommand(msg raft.ApplyMsg) {
+	kv.Lock()
+	defer kv.Unlock()
+
+	cmd := msg.Command.(Op)
+	var opReply OpReply
+
+	opReply.Term = msg.CommandTerm
+
+	// 检查跟上一次命令是否相同，相同则不做处理
+	if !kv.isSameWithPrevious(cmd) {
+		switch cmd.Op {
+		case "Get":
+			if oldValue, ok := kv.kvMap[cmd.Key]; ok {
+				// 存在
+				opReply.Value = oldValue
+				opReply.Err = OK
+			} else {
+				// 不存在
+				opReply.Err = ErrNoKey
+				opReply.Value = ""
+			}
+			mylog("KVServer[", kv.me, "]Get(", cmd.Key, ")")
+		case "Put":
+			kv.kvMap[cmd.Key] = cmd.Value
+			opReply.Err = OK
+			mylog("KVServer[", kv.me, "]Put(", cmd.Key, ", ", cmd.Value, ")")
+		case "Append":
+			if oldValue, ok := kv.kvMap[cmd.Key]; ok {
+				kv.kvMap[cmd.Key] = oldValue + cmd.Value
+			} else {
+				kv.kvMap[cmd.Key] = cmd.Value
+			}
+			opReply.Err = OK
+			mylog("KVServer[", kv.me, "]Append(", cmd.Key, ", ", cmd.Value, ")")
+		}
+
+		opRes := &OpResult{
+			ClientId:     cmd.ClientId,
+			OpNo:         cmd.OpNo,
+			Term:         msg.CommandTerm,
+			CommandIndex: msg.CommandIndex,
+		}
+		kv.lastClientOpMap[cmd.ClientId] = opRes
+	}
+
+	if false {
+		if oldValue, ok := kv.kvMap[cmd.Key]; ok {
+			mylog("存在Key:", cmd.Key, "，Value:", oldValue)
+		} else {
+			mylog("不存在Key:", cmd.Key)
+		}
+	}
+
+	if opResult, ok := kv.lastCommandMap[msg.CommandIndex]; ok {
+		//mylog("lastCommandMap中存在日志索引[", msg.CommandIndex, "]")
+
+		switch cmd.Op {
+		case "Get":
+			if oldValue, ok := kv.kvMap[cmd.Key]; ok {
+				// 存在
+				opReply.Value = oldValue
+				opReply.Err = OK
+			} else {
+				// 不存在
+				opReply.Err = ErrNoKey
+				opReply.Value = ""
+			}
+		default:
+			opReply.Err = OK
+		}
+
+		go func() {
+			opResult.NotifyCh <- opReply
+		}()
+
+		delete(kv.lastCommandMap, msg.CommandIndex)
+		mylog("KVServer[", kv.me, "]中lastCommandMap删除", msg.CommandIndex, "成功")
+	} else {
+		//mylog("lastCommandMap中不存在日志索引[", msg.CommandIndex, "]")
+	}
+
 }

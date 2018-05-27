@@ -41,6 +41,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 // 3种状态
@@ -1179,6 +1180,7 @@ func (rf *Raft)handleSendApplyCh(applyCh chan ApplyMsg) {
 							CommandValid : true,
 							Command      : rf.log[i].Command,
 							CommandIndex : rf.log[i].Index,
+							CommandTerm  : rf.log[i].Term,
 						}
 						applyCh <- msg
 						mylog(rf.getStatusInfo(), "向ApplyCh发送", msg)

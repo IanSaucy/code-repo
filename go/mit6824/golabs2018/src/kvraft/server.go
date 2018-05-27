@@ -7,6 +7,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
 const Debug = 0
@@ -50,29 +51,13 @@ type Op struct {
 	Value    string
 }
 
-const OP_STATE_STARTED = 1  // 已经调用了raft的Start，但是没有收到响应
-const OP_STATE_APPLIED = 2  // 收到了raft的apply消息
-const OP_STATE_REPLACED = 3 // 提交的命令的日志索引被其他命令占去了
-
 type OpReply struct {
-	Term int
-
-	WrongLeader bool
-	Err         Err
-	Value       string
-}
-
-type OpResult struct {
 	ClientId int64
-	OpNo     int64 // 唯一操作编号
-
-	Term         int
-	CommandIndex int
-
-	NotifyCh  chan OpReply // 通知其他等待的
-	WaitCount int          // 等待的个数计数
-
-	reply OpReply
+	OpNo     int64
+	Term  int
+	Index int
+	Err   Err
+	Value string
 }
 
 type KVServer struct {
@@ -90,9 +75,9 @@ type KVServer struct {
 
 	// clientId -> 操作结果
 	// 由于一个客户端一次只会发起一次请求，但是可能重复发送
-	lastClientOpMap map[int64]*OpResult
+	lastClientOpMap map[int64]*OpReply
 	// CommandIndex -> 请求
-	lastCommandMap map[int]*OpResult
+	lastCommandMap map[int]chan OpReply
 }
 
 func (kv *KVServer) Lock() {
@@ -110,7 +95,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	opReply := kv.tryOp("Get", args.ClientId, args.OpNo, args.Key, "")
-	reply.WrongLeader = opReply.WrongLeader
+	reply.WrongLeader = opReply.Err == WrongLeader
 	reply.Err = opReply.Err
 	reply.Value = opReply.Value
 
@@ -120,6 +105,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) tryOp(op string, clientId int64, opNo int64, key string, value string) OpReply {
+	// 检查一下跟之前的是不是同一个，是同一个直接返回
+	kv.Lock()
+	if opReply, ok := kv.lastClientOpMap[clientId]; ok && opReply.ClientId == clientId && opReply.OpNo == opNo {
+		kv.Unlock()
+		mylog("KVServer[", kv.me, "]是已经存在ClientId[", clientId, "]Op[", opNo, "]")
+		return *opReply
+	}
+	kv.Unlock()
+
 	cmd := Op{
 		Op:       op,
 		ClientId: clientId,
@@ -131,27 +125,29 @@ func (kv *KVServer) tryOp(op string, clientId int64, opNo int64, key string, val
 	mylog("KVServer[", kv.me, "]发起命令Client[", clientId, "]Op[", opNo, "]", op, ",", key, ",", value, ",任期[", term, "]日志索引[", index, "]")
 
 	if !isLeader {
-		return OpReply{WrongLeader: true, Err: WrongLeader}
+		return OpReply{Err: WrongLeader}
 	} else {
-		opRes := &OpResult{
-			ClientId:     clientId,
-			OpNo:         opNo,
-			Term:         term,
-			CommandIndex: index,
-			NotifyCh:     make(chan OpReply),
-		}
+		mylog("KVServer[", kv.me, "]是Leader")
+		
+		notifyCh := make(chan OpReply)
 		kv.Lock()
-		kv.lastCommandMap[index] = opRes
+		kv.lastCommandMap[index] = notifyCh
 		kv.Unlock()
 
 		select {
+		case <-time.After(time.Duration(RaftStartTimeout) * time.Millisecond):
+			mylog("KVServer[", kv.me, "]Start之后超时了")
+			kv.Lock()
+			delete(kv.lastCommandMap, index)
+			kv.Unlock()
+			return OpReply{Err:KVServerTimeout}
 		case <-kv.killCh:
 			// 结束
-			return OpReply{WrongLeader: true, Err: KVServerKilled}
-		case opReply := <-opRes.NotifyCh:
+			return OpReply{Err: KVServerKilled}
+		case opReply := <- notifyCh:
 			// 收到通知
 			if opReply.Term != term {
-				return OpReply{WrongLeader: true, Err: WrongLeader}
+				return OpReply{Err: WrongLeader}
 			} else {
 				return opReply
 			}
@@ -167,7 +163,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	opReply := kv.tryOp(args.Op, args.ClientId, args.OpNo, args.Key, args.Value)
-	reply.WrongLeader = opReply.WrongLeader
+	reply.WrongLeader = opReply.Err == WrongLeader
 	reply.Err = opReply.Err
 
 	if DEBUG_PUTAPPEND {
@@ -186,7 +182,6 @@ func (kv *KVServer) Kill() {
 	// Your code here, if desired.
 
 	mylog("KVServer[", kv.me, "]Killed")
-
 	close(kv.killCh)
 }
 
@@ -222,8 +217,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.killCh = make(chan int, 1)
 	kv.kvMap = make(map[string]string)
-	kv.lastClientOpMap = make(map[int64]*OpResult)
-	kv.lastCommandMap = make(map[int]*OpResult)
+	kv.lastClientOpMap = make(map[int64]*OpReply)
+	kv.lastCommandMap = make(map[int]chan OpReply)
 
 	go kv.applyCommandThread()
 
@@ -271,45 +266,36 @@ func (kv *KVServer) applyValidCommand(msg raft.ApplyMsg) {
 	defer kv.Unlock()
 
 	cmd := msg.Command.(Op)
-	var opReply OpReply
+	opReply := OpReply{ClientId : cmd.ClientId, OpNo : cmd.OpNo,  Term : msg.CommandTerm, Index : msg.CommandIndex, Err : OK, Value : ""}
 
-	opReply.Term = msg.CommandTerm
-
-	// 检查跟上一次命令是否相同，相同则不做处理
-	if !kv.isSameWithPrevious(cmd) {
-		switch cmd.Op {
-		case "Get":
+	// 客户端同样的命令有可能执行了多次，Get要以最后一次为主,Put/Append则必须只执行一次
+	if cmd.Op == OpGet {
 			if oldValue, ok := kv.kvMap[cmd.Key]; ok {
 				// 存在
 				opReply.Value = oldValue
-				opReply.Err = OK
 			} else {
 				// 不存在
 				opReply.Err = ErrNoKey
 				opReply.Value = ""
 			}
-			mylog("KVServer[", kv.me, "]Get(", cmd.Key, ")")
-		case "Put":
+			//mylog("KVServer[", kv.me, "]Get(", cmd.Key, ")")
+	}
+	
+	if !kv.isSameWithPrevious(cmd)  {
+		 if cmd.Op == OpPut {
 			kv.kvMap[cmd.Key] = cmd.Value
-			opReply.Err = OK
-			mylog("KVServer[", kv.me, "]Put(", cmd.Key, ", ", cmd.Value, ")")
-		case "Append":
+			//mylog("KVServer[", kv.me, "]Put(", cmd.Key, ", ", cmd.Value, ")")
+		} else {
 			if oldValue, ok := kv.kvMap[cmd.Key]; ok {
 				kv.kvMap[cmd.Key] = oldValue + cmd.Value
 			} else {
 				kv.kvMap[cmd.Key] = cmd.Value
 			}
-			opReply.Err = OK
-			mylog("KVServer[", kv.me, "]Append(", cmd.Key, ", ", cmd.Value, ")")
+			//mylog("KVServer[", kv.me, "]Append(", cmd.Key, ", ", kv.kvMap[cmd.Key], ")")
 		}
-
-		opRes := &OpResult{
-			ClientId:     cmd.ClientId,
-			OpNo:         cmd.OpNo,
-			Term:         msg.CommandTerm,
-			CommandIndex: msg.CommandIndex,
-		}
-		kv.lastClientOpMap[cmd.ClientId] = opRes
+		kv.lastClientOpMap[cmd.ClientId] = &opReply
+	} else {
+		mylog("命令Client[", cmd.ClientId, "]Op[", cmd.OpNo, "]已经执行，不用再次执行")
 	}
 
 	if false {
@@ -320,30 +306,16 @@ func (kv *KVServer) applyValidCommand(msg raft.ApplyMsg) {
 		}
 	}
 
-	if opResult, ok := kv.lastCommandMap[msg.CommandIndex]; ok {
+	if notifyCh, ok := kv.lastCommandMap[msg.CommandIndex]; ok {
 		//mylog("lastCommandMap中存在日志索引[", msg.CommandIndex, "]")
-
-		switch cmd.Op {
-		case "Get":
-			if oldValue, ok := kv.kvMap[cmd.Key]; ok {
-				// 存在
-				opReply.Value = oldValue
-				opReply.Err = OK
-			} else {
-				// 不存在
-				opReply.Err = ErrNoKey
-				opReply.Value = ""
-			}
-		default:
-			opReply.Err = OK
-		}
-
+		
 		go func() {
-			opResult.NotifyCh <- opReply
+			notifyCh <- opReply
 		}()
 
-		delete(kv.lastCommandMap, msg.CommandIndex)
-		mylog("KVServer[", kv.me, "]中lastCommandMap删除", msg.CommandIndex, "成功")
+		delete(
+		kv.lastCommandMap, msg.CommandIndex)
+		//mylog("KVServer[", kv.me, "]中lastCommandMap删除", msg.CommandIndex, "成功")
 	} else {
 		//mylog("lastCommandMap中不存在日志索引[", msg.CommandIndex, "]")
 	}

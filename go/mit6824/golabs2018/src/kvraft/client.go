@@ -56,53 +56,43 @@ func (ck *Clerk) tryOp(op string, args interface{}) interface{} {
 			reply = &PutAppendReply{}
 		}
 
-		ch := make(chan bool)
+		if DEBUG_CLIENT {
+			mylog("向KVServer[", ck.leader, "]开始发送请求", OpStructToString(args))
+		}
+		ok := ck.servers[ck.leader].Call(op, args, reply)
+		if DEBUG_CLIENT {
+			mylog("向KVServer[", ck.leader, "]结束发送请求", OpStructToString(reply))
+		}
 
-		go func(leader int) {
-			if DEBUG_CLIENT {
-				mylog("向KVServer[", leader, "]开始发送请求", OpStructToString(args))
+		// 收到RPC返回
+		var err Err
+
+		if op == KVServerGet {
+			tmpArgs := reply.(*GetReply)
+			err = tmpArgs.Err
+		} else {
+			tmpArgs := reply.(*PutAppendReply)
+			err = tmpArgs.Err
+		}
+
+		if ok {
+			if err == OK || err == ErrNoKey || err == KVServerKilled {
+				mylog("结束发送请求", OpStructToString(args))
+				return reply
+			} else if err == WrongLeader || err == KVServerTimeout {
+				// 继续
+			}  else {
+				mylog(OpStructToString(args), "发生未知错误[", err, "]")
 			}
-			ok := ck.servers[leader].Call(op, args, reply)
-			if DEBUG_CLIENT {
-				mylog("向KVServer[", leader, "]结束发送请求", OpStructToString(reply))
-			}
-			ch <- ok
-		}(ck.leader)
 
-		select {
-		case <-time.After(time.Duration(KVServerRPCTimeout) * time.Millisecond):
-			// 超时了，继续
-		case ok := <-ch:
-			// 收到RPC返回
-			var err Err
-
-			if op == KVServerGet {
-				tmpArgs := reply.(*GetReply)
-				err = tmpArgs.Err
-			} else {
-				tmpArgs := reply.(*PutAppendReply)
-				err = tmpArgs.Err
-			}
-
-			if ok {
-				if err == OK || err == ErrNoKey || err == KVServerKilled {
-					mylog("结束发送请求", OpStructToString(args))
-					return reply
-				} else if err == WrongLeader {
-					// 不是leader，继续
-				}  else {
-					mylog(OpStructToString(args), "发生未知错误[", err, "]")
-				}
-
-			} else {
-				// RPC未正常返回
-				mylog("RPC Call未正常返回")
-			}
+		} else {
+			// RPC未正常返回
+			mylog("RPC Call未正常返回")
 		}
 
 		ck.leader = (ck.leader + 1) % len(ck.servers)
 		if ck.leader == startLeader { // 走了一圈
-			time.Sleep(time.Duration(raft.MAX_ELECTION_TIMEOUT) * time.Millisecond)
+			time.Sleep(time.Duration(raft.MIN_ELECTION_TIMEOUT) * time.Millisecond)
 		}
 	}
 }

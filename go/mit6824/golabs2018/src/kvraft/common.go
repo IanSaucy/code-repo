@@ -8,14 +8,18 @@ const (
 	ErrNoKey = "ErrNoKey"
 	KVServerKilled = "KVServerKilled"
 	WrongLeader = "WrongLeader"
-	
+	KVServerTimeout = "KVServerTimeout"
 
 	// RPC的名字
 	KVServerGet = "KVServer.Get"
 	KVServerPutAppend = "KVServer.PutAppend"
 
+	OpGet = "Get"
+	OpPut = "Put"
+	OpAppend = "Append"
+	
 	// KVServer RPC超时时间
-	KVServerRPCTimeout = 200
+	RaftStartTimeout = 3000
 )
 
 type Err string

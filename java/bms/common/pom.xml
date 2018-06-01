@@ -14,7 +14,7 @@
   <url>http://maven.apache.org</url>
   
   <properties>
-  
+  	<spring.version>5.0.5.RELEASE</spring.version>  
   </properties>
   
   <dependencies>
@@ -35,28 +35,41 @@
 	<dependency>
 	    <groupId>org.springframework</groupId>
 	    <artifactId>spring-context</artifactId>
-	    <version>5.0.5.RELEASE</version>
+	    <version>${spring.version}</version>
     </dependency>
     <dependency>
 	    <groupId>org.springframework</groupId>
 	    <artifactId>spring-webmvc</artifactId>
-	    <version>5.0.5.RELEASE</version>
+	    <version>${spring.version}</version>
     </dependency>
     <dependency>
 	    <groupId>org.springframework</groupId>
 	    <artifactId>spring-jdbc</artifactId>
-	    <version>5.0.5.RELEASE</version>
+	    <version>${spring.version}</version>
     </dependency>
     <dependency>
 	    <groupId>org.springframework</groupId>
 	    <artifactId>spring-tx</artifactId>
-	    <version>5.0.5.RELEASE</version>
+	    <version>${spring.version}</version>
     </dependency>
     <dependency>
 	    <groupId>org.springframework</groupId>
 	    <artifactId>spring-aspects</artifactId>
-	    <version>5.0.5.RELEASE</version>
+	    <version>${spring.version}</version>
     </dependency>
+    <dependency>
+  		<groupId>org.springframework</groupId>
+  		<artifactId>spring-core</artifactId>
+  		<version>${spring.version}</version>
+	</dependency>
+    
+	<!-- https://mvnrepository.com/artifact/org.mybatis/mybatis -->
+	<dependency>
+	    <groupId>org.mybatis</groupId>
+	    <artifactId>mybatis</artifactId>
+	    <version>3.4.6</version>
+	</dependency>
+
 	
 	<!-- javax.servlet -->
 	<dependency>
